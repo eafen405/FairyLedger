@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 运行时产物
+*.db
+*.db-journal
+backups/
+.pytest_cache/

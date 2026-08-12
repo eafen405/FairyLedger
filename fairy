@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""FairyLedger CLI 单入口（spec D5）：fairy [--db PATH] <命令> ...
+
+部署到 Fairy 云端环境时亦可 `pip install .` 以 console_script `fairy` 安装。
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from fairyledger.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())

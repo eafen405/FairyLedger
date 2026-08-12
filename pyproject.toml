@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fairyledger"
+version = "0.1.0"
+description = "柴油机配件进销存 CLI（FairyLedger v4）"
+requires-python = ">=3.10"
+
+[project.scripts]
+fairy = "fairyledger.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fairyledger*"]
