@@ -97,9 +97,9 @@
 
 ## Implementation Decisions
 
-### D1 数据模型（8 表 DDL，T1 定稿）
+### D1 数据模型（7 表 DDL，T1 定稿）
 
-SQLite 单文件库，8 张表。`products`、`aliases`、`counterparties`、`transactions`、`payments`、`opening_stock`、`audit_log`（建表语句见下）。要点：
+SQLite 单文件库，7 张表。`products`、`aliases`、`counterparties`、`transactions`、`payments`、`opening_stock`、`audit_log`（建表语句见下）。要点：
 
 - **图号身份**：`drawing_no` 唯一且非空，是唯一查询凭据；厂家无图号时按 `ZC-` 前缀递增自编，与厂家号共用同一列。
 - **别名**：独立表，0..N 可空；查询时图号/名称/别名一起模糊搜。
@@ -278,6 +278,7 @@ CREATE TABLE audit_log (
 | `fairy query credit [--counterparty 名] [--from --to]` | 挂账对账单（一维表 + 单位欠款总览） |
 | `fairy query margin --from D --to D [--product <图号>] [--customer 名]` | 期间毛利（默认本月） |
 | `fairy query history --drawing-no <图号> [--from --to]` | 单产品全部流水（进货/售出/红冲逐笔） |
+| `fairy query product --q <词段...>` | 商品检索（歧义消解）：图号精确命中优先；否则输入按 数字/字母 与 中文 边界拆词段，在 图号/名称/别名 间做 AND 包含匹配。返回 `{"match": "exact"\|"multiple"\|"none", "products": [...]}`——唯一命中直接确认（回显图号）、多命中列候选报序号、无命中 none（非行数组，输出契约例外） |
 
 **报告类**：
 
@@ -376,7 +377,7 @@ CREATE TABLE audit_log (
   - edit：部分更新、不允许改图号、每次写审计、改价不改成本快照。
   - 原子性：制造中途失败（如红冲不存在的原单）断言不留半截数据。
   - 退出码与错误路径：无此商品、参数缺失、DB 异常。
-  - 查询类与报告类：price / stock / credit / margin / history、report daily（JSON 四块）、report period（Excel 产出）、export（5 Sheet）、backup（7 份轮转）。
+  - 查询类与报告类：price / stock / credit / margin / history / product、report daily（JSON 四块）、report period（Excel 产出）、export（5 Sheet）、backup（7 份轮转）。
 - **prior art**：仓库内无既有测试；`refer/` 下 v3 脚本仅历史背景、非设计标准。本 spec 为 v4 确立第一套测试约定，后续实现沿用此单一 seam 模式。
 
 ## Out of Scope

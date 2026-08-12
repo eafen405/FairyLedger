@@ -2,7 +2,6 @@
 
 表结构逐字对齐 spec D1：products/aliases/counterparties/transactions/
 payments/opening_stock/audit_log 共 7 张表 + transactions 3 个索引。
-（规格文字写「8 表」，但 DDL 与 T1 验收清单均为 7 张表，以 DDL 为准。）
 """
 
 import os
