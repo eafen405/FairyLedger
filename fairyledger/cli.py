@@ -10,7 +10,7 @@ import sqlite3
 import sys
 from typing import Any, Sequence
 
-from . import db, products
+from . import db, ledger, products
 from .errors import BusinessError
 
 
@@ -33,6 +33,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--name", help="正式名称（必填）")
     p_add.add_argument("--unit", help="单位，纯文本；缺省 '件'")
     p_add.add_argument("--alias", action="append", dest="aliases", help="别名，可多次")
+
+    p_purchase = sub.add_parser("purchase", help="进货")
+    p_purchase.add_argument("--drawing-no", help="图号（必填）")
+    p_purchase.add_argument("--qty", type=float, help="数量（必填，正数）")
+    p_purchase.add_argument("--price", type=float, help="进价（必填，不能为负）")
+    p_purchase.add_argument("--freight", type=float, help="运费，可空默认 0")
+    p_purchase.add_argument("--supplier", help="供应商名称，可空；不存在自动建档")
+    p_purchase.add_argument("--date", help="业务日期 YYYY-MM-DD，缺省今天")
+    p_purchase.add_argument("--note", help="备注，可空")
+
+    p_opening = sub.add_parser("opening", help="期初库存录入（追加语义，可多次）")
+    p_opening.add_argument("--drawing-no", help="图号（必填）")
+    p_opening.add_argument("--qty", type=float, help="数量（必填，正数）")
+    p_opening.add_argument("--cost", type=float, help="期初成本，缺省 0")
 
     p_query = sub.add_parser("query", help="查询")
     p_query_sub = p_query.add_subparsers(dest="subcommand", metavar="<子命令>")
@@ -75,8 +89,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                         conn, args.drawing_no, args.name, args.unit, args.aliases
                     )
                 )
+            elif args.command == "purchase":
+                _emit(
+                    ledger.record_purchase(
+                        conn, args.drawing_no, args.qty, args.price,
+                        args.freight, args.supplier, args.date, args.note,
+                    )
+                )
+            elif args.command == "opening":
+                _emit(ledger.record_opening(conn, args.drawing_no, args.qty, args.cost))
             elif args.command == "query" and args.subcommand == "stock":
-                _emit(products.query_stock(conn, args.drawing_no))
+                _emit(ledger.query_stock(conn, args.drawing_no))
             elif args.command == "query" and args.subcommand == "product":
                 q = (args.q or "").strip()
                 if not q:

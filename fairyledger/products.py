@@ -1,4 +1,4 @@
-"""商品主数据：建档、当前库存、商品检索（T1 范围）。"""
+"""商品主数据：建档与商品检索（T1 范围；当前库存/成本查询在 ledger.py）。"""
 
 import re
 import sqlite3
@@ -58,33 +58,6 @@ def add_product(
         (pid,),
     ).fetchone()
     return {**dict(row), "aliases": alias_list}
-
-
-def query_stock(
-    conn: sqlite3.Connection, drawing_no: str | None = None
-) -> list[dict[str, Any]]:
-    """当前库存：期初合计 + 流水净量现算（ADR 0001），默认图号序。
-
-    流水方向按 biz_type 定符号：purchase/sale_return 加、sale/purchase_return 减。
-    """
-    sql = """
-        SELECT p.id, p.drawing_no, p.name, p.unit,
-               COALESCE((SELECT SUM(o.qty) FROM opening_stock o
-                          WHERE o.product_id = p.id), 0)
-             + COALESCE((SELECT SUM(CASE t.biz_type
-                             WHEN 'purchase' THEN t.qty
-                             WHEN 'sale_return' THEN t.qty
-                             WHEN 'sale' THEN -t.qty
-                             WHEN 'purchase_return' THEN -t.qty END)
-                          FROM transactions t WHERE t.product_id = p.id), 0) AS qty
-          FROM products p
-    """
-    params: list[Any] = []
-    if drawing_no:
-        sql += " WHERE p.drawing_no = ? COLLATE NOCASE"
-        params.append(drawing_no)
-    sql += " ORDER BY p.drawing_no"
-    return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
 def _aliases(conn: sqlite3.Connection, product_id: int) -> list[str]:

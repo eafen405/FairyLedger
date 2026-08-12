@@ -5,6 +5,7 @@
 只读打开临时库核对表/列（spec 允许对无 CLI 暴露处做只读核对）。
 """
 
+import datetime
 import json
 import sqlite3
 import subprocess
@@ -83,6 +84,34 @@ class T1Base(unittest.TestCase):
         cp = self.fairy("product", "add", *args)
         self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
         return json.loads(cp.stdout)
+
+    def purchase(self, *args: str) -> dict:
+        cp = self.fairy("purchase", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def opening(self, *args: str) -> dict:
+        cp = self.fairy("opening", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def query_db(self, sql: str, *params) -> list[tuple]:
+        """只读打开临时库核对无 CLI 暴露处的行级事实（spec Testing Decisions 允许）。"""
+        conn = sqlite3.connect(str(self.db))
+        try:
+            return conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
+    def stock_rows(self) -> list[dict]:
+        cp = self.fairy("query", "stock")
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def stock_row(self, drawing_no: str) -> dict:
+        rows = [r for r in self.stock_rows() if r["drawing_no"] == drawing_no]
+        self.assertEqual(len(rows), 1, f"应恰好一行: {rows}")
+        return rows[0]
 
 
 class TestSchemaInit(T1Base):
@@ -276,6 +305,211 @@ class TestErrorContract(T1Base):
         cp = self.fairy("product", "add")
         self.assertEqual(cp.returncode, 1)
         self.assertEqual(cp.stdout, "", "错误消息不应出现在 stdout")
+
+
+class TestPurchase(T1Base):
+    """T2 进货：必填校验、无此商品、供应商 create-or-resolve、默认值、原子性。"""
+
+    def test_qty_and_price_required(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        for args in (
+            ("--drawing-no", "170", "--price", "10"),
+            ("--drawing-no", "170", "--qty", "3"),
+        ):
+            cp = self.fairy("purchase", *args)
+            self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+            self.assertIn("参数缺失", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 0,
+                         "参数缺失不应落任何流水")
+
+    def test_drawing_no_required(self):
+        cp = self.fairy("purchase", "--qty", "3", "--price", "10")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("参数缺失", cp.stderr)
+
+    def test_unknown_product_exit1(self):
+        cp = self.fairy("purchase", "--drawing-no", "NOPE", "--qty", "3", "--price", "10")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("无此商品", cp.stderr)
+
+    def test_basic_purchase_writes_tx_and_stock(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+        out = self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10")
+        self.assertEqual(out["biz_type"], "purchase")
+        self.assertEqual(out["qty"], 5.0)
+        self.assertEqual(out["price"], 10.0)
+        self.assertEqual(out["freight"], 0.0, "运费可空默认 0")
+        self.assertEqual(out["biz_date"], datetime.date.today().isoformat(), "日期缺省今天")
+        self.assertIsNone(out["note"])
+        self.assertIsNone(out["supplier"], "供应商可空")
+        self.assertEqual(out["drawing_no"], "170")
+        self.assertEqual(out["name"], "活塞")
+        self.assertIn("id", out)
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 5.0)
+        self.assertEqual(row["unit_cost"], 10.0, "无期初时均价退化为进货单价")
+        self.assertEqual(row["amount"], 50.0)
+
+    def test_freight_date_note_filled(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        out = self.purchase(
+            "--drawing-no", "170", "--qty", "3", "--price", "50",
+            "--freight", "20", "--date", "2026-08-01", "--note", "加急",
+        )
+        self.assertEqual(out["freight"], 20.0)
+        self.assertEqual(out["biz_date"], "2026-08-01")
+        self.assertEqual(out["note"], "加急")
+        row = self.stock_row("170")
+        self.assertEqual(row["unit_cost"], 50.0, "运费不进加权公式")
+        self.assertEqual(row["amount"], 150.0)
+
+    def test_supplier_create_or_resolve(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        out = self.purchase("--drawing-no", "170", "--qty", "1", "--price", "10", "--supplier", "甲厂")
+        self.assertEqual(out["supplier"], "甲厂")
+        self.assertEqual(self.query_db("SELECT name, is_supplier FROM counterparties"),
+                         [("甲厂", 1)], "新供应商自动建档并打供应商标记")
+        self.purchase("--drawing-no", "170", "--qty", "1", "--price", "10", "--supplier", "甲厂")
+        self.assertEqual(len(self.query_db("SELECT id FROM counterparties")), 1,
+                         "同名供应商复用，不重复建档")
+
+    def test_negative_qty_and_price_rejected(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        cp = self.fairy("purchase", "--drawing-no", "170", "--qty", "-3", "--price", "10")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("正数", cp.stderr)
+        cp = self.fairy("purchase", "--drawing-no", "170", "--qty", "3", "--price", "-5")
+        self.assertEqual(cp.returncode, 1)
+        self.assertNotEqual(cp.stderr, "")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 0)
+
+    def test_atomic_failure_leaves_no_partial_data(self):
+        # 商品不存在时，即使供应商解析先发生也不留半截数据（单事务原子）
+        cp = self.fairy("purchase", "--drawing-no", "NOPE", "--qty", "2",
+                        "--price", "10", "--supplier", "甲厂")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("无此商品", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 0)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM counterparties")[0][0], 0,
+                         "中途失败不应留下供应商档案")
+
+
+class TestOpening(T1Base):
+    """T2 期初库存：追加语义、成本缺省 0、无此商品、校验。"""
+
+    def test_append_semantics(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        out = self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        self.assertEqual(out["qty"], 10.0)
+        self.assertEqual(out["cost"], 4.0)
+        self.assertEqual(out["drawing_no"], "170")
+        self.assertEqual(out["name"], "活塞")
+        self.opening("--drawing-no", "170", "--qty", "5", "--cost", "4")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 15.0, "同商品多次期初累加")
+
+    def test_cost_default_zero(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        out = self.opening("--drawing-no", "170", "--qty", "5")
+        self.assertEqual(out["cost"], 0.0, "期初成本缺省 0")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 5.0)
+        self.assertEqual(row["unit_cost"], 0.0)
+        self.assertEqual(row["amount"], 0.0)
+
+    def test_unknown_product_exit1(self):
+        cp = self.fairy("opening", "--drawing-no", "NOPE", "--qty", "5")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("无此商品", cp.stderr)
+
+    def test_qty_must_be_positive(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        cp = self.fairy("opening", "--drawing-no", "170", "--qty", "0")
+        self.assertEqual(cp.returncode, 1)
+        self.assertNotEqual(cp.stderr, "")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM opening_stock")[0][0], 0)
+
+    def test_negative_cost_rejected(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        cp = self.fairy("opening", "--drawing-no", "170", "--qty", "5", "--cost", "-1")
+        self.assertEqual(cp.returncode, 1)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM opening_stock")[0][0], 0)
+
+
+class TestStockCost(T1Base):
+    """T2 库存报表：数量/当前加权均价/金额全现算，默认图号序。"""
+
+    def test_zero_state(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 0.0)
+        self.assertEqual(row["unit_cost"], 0.0)
+        self.assertEqual(row["amount"], 0.0)
+
+    def test_opening_as_weighted_base(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 15.0)
+        self.assertEqual(row["unit_cost"], 6.0, "有期初时以期为基数重算 (40+50)/15")
+        self.assertEqual(row["amount"], 90.0)
+
+    def test_moving_average_recomputes_per_purchase(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10")   # 均价 → 6
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "14")   # 均价 → 8
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 20.0)
+        self.assertEqual(row["unit_cost"], 8.0, "(90+70)/20")
+        self.assertEqual(row["amount"], 160.0)
+
+    def test_freight_excluded_from_avg(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10", "--freight", "20")
+        row = self.stock_row("170")
+        self.assertEqual(row["unit_cost"], 6.0, "运费不进公式分子分母")
+        self.assertEqual(row["amount"], 90.0)
+
+    def test_multiple_opening_rows_aggregate_base(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.opening("--drawing-no", "170", "--qty", "5", "--cost", "20")
+        self.opening("--drawing-no", "170", "--qty", "3", "--cost", "30")
+        self.purchase("--drawing-no", "170", "--qty", "2", "--price", "10")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 10.0)
+        self.assertEqual(row["unit_cost"], 21.0, "(100+90+20)/10")
+        self.assertEqual(row["amount"], 210.0)
+
+    def test_default_order_by_drawing_no(self):
+        for dn, name in [("300.14.14", "缸盖"), ("170", "活塞")]:
+            self.add_product("--drawing-no", dn, "--name", name)
+        self.opening("--drawing-no", "170", "--qty", "2", "--cost", "5")
+        rows = self.stock_rows()
+        self.assertEqual([r["drawing_no"] for r in rows], ["170", "300.14.14"])
+        self.assertEqual(rows[0]["qty"], 2.0)
+        self.assertEqual(rows[1]["qty"], 0.0)
+
+    def test_stock_row_keys(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+        self.opening("--drawing-no", "170", "--qty", "2", "--cost", "5")
+        row = self.stock_row("170")
+        self.assertEqual(set(row), {"id", "drawing_no", "name", "unit", "qty", "unit_cost", "amount"})
+
+    def test_filtered_stock_keeps_cost_columns(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.add_product("--drawing-no", "171", "--name", "活塞环")
+        self.opening("--drawing-no", "170", "--qty", "2", "--cost", "5")
+        cp = self.fairy("query", "stock", "--drawing-no", "170")
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        rows = json.loads(cp.stdout)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["drawing_no"], "170")
+        self.assertEqual(rows[0]["qty"], 2.0)
+        self.assertEqual(rows[0]["unit_cost"], 5.0)
+        self.assertEqual(rows[0]["amount"], 10.0)
 
 
 if __name__ == "__main__":
