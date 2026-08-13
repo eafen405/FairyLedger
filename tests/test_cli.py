@@ -1448,5 +1448,423 @@ class TestHistory(T1Base):
         self.assertIsNone(sale_row["counterparty"])
 
 
+class TestReportDaily(T1Base):
+    """T6 日报（spec D6 四块）：默认昨天；无业务日汇总为零、异常区为空；
+    毛利 = 售出净额 − 成本净额、运费单列不进毛利；挂账块按已确认口径
+    （新增挂账额 = 挂账单位当日交易净额、收款/付款合计只算挂账单位、
+    余额全历史现算）；明细当日逐笔（进货/售出/退货）、退货带「红冲」ref 标记；
+    异常提醒 = 当日售出单价偏离该商品上次成交价（商品全局、严格更早）±30%。"""
+
+    def _seed(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+        self.add_product("--drawing-no", "171", "--name", "活塞环", "--unit", "件")
+        self.opening("--drawing-no", "170", "--qty", "100", "--cost", "4")
+        self.opening("--drawing-no", "171", "--qty", "100", "--cost", "6")
+
+    def daily(self, *args: str) -> dict:
+        cp = self.fairy("report", "daily", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def test_daily_defaults_to_yesterday(self):
+        y = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        self._seed()
+        self.purchase("--drawing-no", "170", "--qty", "10", "--price", "5", "--date", y)
+        out = self.daily()
+        self.assertEqual(out["date"], y)
+        self.assertEqual(out["summary"]["purchase"], {"count": 1, "amount": 50.0})
+
+    def test_daily_empty_day_all_zero(self):
+        self._seed()
+        out = self.daily("--date", "2026-08-01")
+        self.assertEqual(out, {
+            "date": "2026-08-01",
+            "summary": {"purchase": {"count": 0, "amount": 0.0},
+                        "sale": {"count": 0, "amount": 0.0},
+                        "freight": 0.0, "margin": 0.0},
+            "credit": {"new_credit": 0.0, "received": 0.0, "paid": 0.0,
+                       "balance": 0.0},
+            "details": [], "alerts": [],
+        }, "无业务日汇总为零、异常区为空")
+
+    def test_daily_summary_basic(self):
+        self._seed()
+        self.purchase("--drawing-no", "170", "--qty", "10", "--price", "5",
+                      "--freight", "10", "--date", "2026-08-10")
+        self.sale("--drawing-no", "171", "--qty", "3", "--price", "15",
+                  "--freight", "5", "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        s = out["summary"]
+        self.assertEqual(s["purchase"], {"count": 1, "amount": 50.0})
+        self.assertEqual(s["sale"], {"count": 1, "amount": 45.0})
+        self.assertEqual(s["freight"], 15.0, "运费 = 进货+售出 freight 求和")
+        self.assertEqual(s["margin"], 27.0, "毛利 = 售出金额 − 成本快照合计 (45−3×6)")
+
+    def test_daily_summary_nets_returns(self):
+        self._seed()
+        p = self.purchase("--drawing-no", "170", "--qty", "10", "--price", "5",
+                          "--freight", "10", "--date", "2026-08-10")
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                      "--date", "2026-08-10")
+        self.reverse("--tx", str(s["id"]), "--date", "2026-08-10")
+        self.reverse("--tx", str(p["id"]), "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        s = out["summary"]
+        self.assertEqual(s["purchase"], {"count": 0, "amount": 0.0}, "进货退货净额冲减")
+        self.assertEqual(s["sale"], {"count": 0, "amount": 0.0}, "售出退货净额冲减")
+        self.assertEqual(s["freight"], 10.0, "退货 freight=0，只留原单运费")
+        self.assertEqual(s["margin"], 0.0)
+
+    def test_daily_summary_partial_returns(self):
+        self._seed()
+        s1 = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                       "--date", "2026-08-10")
+        self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                  "--date", "2026-08-10")
+        self.reverse("--tx", str(s1["id"]), "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        s = out["summary"]
+        self.assertEqual(s["sale"], {"count": 1, "amount": 20.0})
+        self.assertEqual(s["margin"], 12.0, "净额: 45+20−45 收入、12+8−12 成本")
+
+    def test_daily_credit_block(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-10")
+        self.receive("--counterparty", "乙店", "--amount", "10", "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual(out["credit"],
+                         {"new_credit": 30.0, "received": 10.0, "paid": 0.0,
+                          "balance": 20.0})
+
+    def test_daily_new_credit_nets_return(self):
+        self._seed()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "10",
+                      "--customer", "乙店", "--credit", "--date", "2026-08-10")
+        self.reverse("--tx", str(s["id"]), "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual(out["credit"]["new_credit"], 0.0, "挂账退货负金额冲减新增挂账额")
+        self.assertEqual(out["credit"]["balance"], 0.0)
+
+    def test_daily_new_credit_includes_credit_purchase(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-10")
+        self.purchase("--drawing-no", "171", "--qty", "2", "--price", "20",
+                      "--supplier", "乙店", "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual(out["credit"]["new_credit"], 70.0, "挂账单位进货也计新增挂账额")
+
+    def test_daily_received_paid_only_credit_units(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-10")
+        self.receive("--counterparty", "乙店", "--amount", "10", "--date", "2026-08-10")
+        self.receive("--counterparty", "丙店", "--amount", "5", "--date", "2026-08-10")
+        self.pay("--counterparty", "丁厂", "--amount", "7", "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual(out["credit"]["received"], 10.0, "非挂账单位收款不计入")
+        self.assertEqual(out["credit"]["paid"], 0.0, "非挂账单位付款不计入")
+        self.assertEqual(out["credit"]["balance"], 20.0)
+
+    def test_daily_credit_balance_full_history(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        self.receive("--counterparty", "乙店", "--amount", "10", "--date", "2026-08-01")
+        self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual(out["credit"]["new_credit"], 20.0)
+        self.assertEqual(out["credit"]["received"], 0.0, "收款在 8/1，不在日报日")
+        self.assertEqual(out["credit"]["balance"], 40.0, "余额全历史现算 30−10+20")
+
+    def test_daily_details_columns_and_ref_marker(self):
+        self._seed()
+        p = self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10",
+                          "--supplier", "甲厂", "--date", "2026-08-10")
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                      "--customer", "乙店", "--date", "2026-08-10")
+        sr = self.reverse("--tx", str(s["id"]), "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual([r["id"] for r in out["details"]],
+                         [p["id"], s["id"], sr["id"]], "当日逐笔、按录入序")
+        by_id = {r["id"]: r for r in out["details"]}
+        self.assertEqual(set(by_id[s["id"]]),
+                         {"id", "biz_date", "biz_type", "drawing_no", "name", "unit",
+                          "qty", "price", "amount", "counterparty", "ref"})
+        pur = by_id[p["id"]]
+        self.assertEqual(pur["biz_type"], "purchase")
+        self.assertEqual(pur["drawing_no"], "170")
+        self.assertEqual(pur["name"], "活塞")
+        self.assertEqual(pur["unit"], "件")
+        self.assertEqual(pur["qty"], 5.0)
+        self.assertEqual(pur["price"], 10.0)
+        self.assertEqual(pur["amount"], 50.0)
+        self.assertEqual(pur["counterparty"], "甲厂")
+        self.assertIsNone(pur["ref"])
+        ret = by_id[sr["id"]]
+        self.assertEqual(ret["biz_type"], "sale_return")
+        self.assertEqual(ret["amount"], 45.0, "明细金额 = qty×price 原值（方向由类型+ref 标记表达）")
+        self.assertEqual(ret["ref"],
+                         {"id": s["id"], "biz_date": "2026-08-10", "biz_type": "sale"},
+                         "退货行带「红冲」关联原单标记")
+        self.assertIsNone(by_id[s["id"]]["ref"], "普通行无红冲标记")
+
+    def test_daily_excludes_other_days(self):
+        self._seed()
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10",
+                      "--date", "2026-08-09")
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                  "--date", "2026-08-11")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual(out["summary"]["purchase"]["count"], 0)
+        self.assertEqual(out["summary"]["sale"]["count"], 0)
+        self.assertEqual(out["details"], [])
+
+    def test_daily_alerts_flags_30_percent_deviation(self):
+        self._seed()
+        self.add_product("--drawing-no", "172", "--name", "缸盖", "--unit", "件")
+        self.opening("--drawing-no", "172", "--qty", "10", "--cost", "8")
+        # 基线（上次成交价）
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "100",
+                  "--date", "2026-08-05")
+        self.sale("--drawing-no", "171", "--qty", "1", "--price", "50",
+                  "--date", "2026-08-05")
+        self.sale("--drawing-no", "172", "--qty", "1", "--price", "20",
+                  "--date", "2026-08-05")
+        # 当日：170 −40% → 报；171 +20% → 不报；172 +50% → 报
+        s170 = self.sale("--drawing-no", "170", "--qty", "1", "--price", "60",
+                         "--date", "2026-08-10")
+        self.sale("--drawing-no", "171", "--qty", "1", "--price", "60",
+                  "--date", "2026-08-10")
+        s172 = self.sale("--drawing-no", "172", "--qty", "1", "--price", "30",
+                         "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual(out["alerts"],
+                         [{"id": s170["id"], "drawing_no": "170", "name": "活塞",
+                           "qty": 1.0, "price": 60.0, "last_price": 100.0,
+                           "deviation": -0.4},
+                          {"id": s172["id"], "drawing_no": "172", "name": "缸盖",
+                           "qty": 1.0, "price": 30.0, "last_price": 20.0,
+                           "deviation": 0.5}])
+
+    def test_daily_alerts_no_prior_sale_skipped(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "50",
+                  "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual(out["alerts"], [], "首笔成交无上次成交价，不判定")
+        self.assertEqual(out["summary"]["sale"]["count"], 1)
+
+    def test_daily_alerts_global_price_not_customer_scoped(self):
+        # 口径定案：上次成交价 = 商品全局最近价（不限客户）
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "100",
+                  "--customer", "乙店", "--date", "2026-08-05")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "50",
+                  "--customer", "丙店", "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual(len(out["alerts"]), 1, "按商品全局价判定，丙店无同客户历史也报")
+        self.assertEqual(out["alerts"][0]["price"], 50.0)
+        self.assertEqual(out["alerts"][0]["last_price"], 100.0)
+
+    def test_daily_alerts_zero_last_price_no_crash(self):
+        # 售出价允许 0（只拒负）；上次成交价为 0 时无有效基准，跳过判定、不崩溃
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "0",
+                  "--date", "2026-08-05")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "50",
+                  "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual(out["alerts"], [])
+        self.assertEqual(out["summary"]["sale"]["count"], 1)
+
+    def test_daily_alerts_ignore_purchases_and_returns(self):
+        self._seed()
+        s1 = self.sale("--drawing-no", "170", "--qty", "1", "--price", "50",
+                       "--date", "2026-08-01")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "100",
+                  "--date", "2026-08-05")
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "500",
+                      "--date", "2026-08-10")
+        self.reverse("--tx", str(s1["id"]), "--date", "2026-08-10")
+        out = self.daily("--date", "2026-08-10")
+        self.assertEqual(out["alerts"], [],
+                         "异常只查当日售出成交价：进货价与退货行不参与")
+
+    def test_daily_invalid_date_rejected(self):
+        self._seed()
+        cp = self.fairy("report", "daily", "--date", "2026/08/10")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("日期格式", cp.stderr)
+
+
+class TestQueryMargin(T1Base):
+    """T6 期间毛利报表（spec D5/D6）：期间必选默认本月、可按产品/客户过滤；
+    金额/成本/毛利/毛利率；按产品、按客户分组（毛利降序）；
+    售出退货按原单冲减当期（期间内 sale_return 负方向计入）。"""
+
+    def _seed(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+        self.add_product("--drawing-no", "171", "--name", "活塞环", "--unit", "件")
+        self.opening("--drawing-no", "170", "--qty", "100", "--cost", "4")
+        self.opening("--drawing-no", "171", "--qty", "100", "--cost", "6")
+
+    def margin(self, *args: str) -> dict:
+        cp = self.fairy("query", "margin", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def test_margin_defaults_to_current_month(self):
+        today = datetime.date.today()
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                  "--date", today.isoformat())
+        out = self.margin()
+        self.assertEqual(out["from"], f"{today.year:04d}-{today.month:02d}-01")
+        self.assertEqual(out["to"], today.isoformat())
+        self.assertEqual(out["amount"], 20.0)
+
+    def test_margin_half_open_range_rejected(self):
+        self._seed()
+        for args in (("--from", "2026-08-01"), ("--to", "2026-08-10")):
+            cp = self.fairy("query", "margin", *args)
+            self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+            self.assertIn("参数缺失", cp.stderr)
+
+    def test_margin_invalid_date_rejected(self):
+        self._seed()
+        cp = self.fairy("query", "margin", "--from", "2026/08/01", "--to", "2026-08-10")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("日期格式", cp.stderr)
+
+    def test_margin_from_after_to_rejected(self):
+        self._seed()
+        cp = self.fairy("query", "margin", "--from", "2026-08-10", "--to", "2026-08-01")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("晚于", cp.stderr)
+
+    def test_margin_totals(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                  "--date", "2026-08-05")
+        self.sale("--drawing-no", "171", "--qty", "2", "--price", "30",
+                  "--date", "2026-08-06")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "10",
+                  "--date", "2026-08-07")
+        out = self.margin("--from", "2026-08-01", "--to", "2026-08-10")
+        self.assertEqual(out["amount"], 115.0)
+        self.assertEqual(out["cost"], 28.0)
+        self.assertEqual(out["margin"], 87.0)
+        self.assertEqual(out["margin_rate"], round(87 / 115, 4), "毛利率 = 毛利÷售出金额")
+
+    def test_margin_empty_period(self):
+        self._seed()
+        out = self.margin("--from", "2026-08-01", "--to", "2026-08-10")
+        self.assertEqual(out["amount"], 0.0)
+        self.assertEqual(out["cost"], 0.0)
+        self.assertEqual(out["margin"], 0.0)
+        self.assertIsNone(out["margin_rate"], "无售出时毛利率为空")
+        self.assertEqual(out["by_product"], [])
+        self.assertEqual(out["by_customer"], [])
+
+    def test_margin_sale_return_nets_in_period(self):
+        self._seed()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                      "--date", "2026-08-05")
+        self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                  "--date", "2026-08-06")
+        self.reverse("--tx", str(s["id"]), "--date", "2026-08-07")
+        out = self.margin("--from", "2026-08-01", "--to", "2026-08-10")
+        self.assertEqual(out["amount"], 20.0, "售出退货在期间内按原单冲减收入")
+        self.assertEqual(out["cost"], 8.0, "成本同步冲减")
+        self.assertEqual(out["margin"], 12.0)
+
+    def test_margin_return_outside_period_ignored(self):
+        self._seed()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                      "--date", "2026-08-05")
+        self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                  "--date", "2026-08-06")
+        self.reverse("--tx", str(s["id"]), "--date", "2026-08-20")
+        out = self.margin("--from", "2026-08-01", "--to", "2026-08-10")
+        self.assertEqual(out["amount"], 65.0)
+        self.assertEqual(out["cost"], 20.0)
+        self.assertEqual(out["margin"], 45.0)
+
+    def test_margin_groups_by_product_margin_desc(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                  "--date", "2026-08-05")
+        self.sale("--drawing-no", "171", "--qty", "2", "--price", "30",
+                  "--date", "2026-08-06")
+        out = self.margin("--from", "2026-08-01", "--to", "2026-08-10")
+        self.assertEqual([r["drawing_no"] for r in out["by_product"]], ["171", "170"],
+                         "按毛利降序")
+        p170, p171 = out["by_product"][1], out["by_product"][0]
+        self.assertEqual(p170, {"drawing_no": "170", "name": "活塞", "amount": 45.0,
+                                "cost": 12.0, "margin": 33.0,
+                                "margin_rate": round(33 / 45, 4)})
+        self.assertEqual(p171, {"drawing_no": "171", "name": "活塞环", "amount": 60.0,
+                                "cost": 12.0, "margin": 48.0, "margin_rate": 0.8})
+
+    def test_margin_groups_by_customer_including_cash(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                  "--customer", "乙店", "--date", "2026-08-05")
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "20",
+                  "--customer", "乙店", "--date", "2026-08-06")
+        self.sale("--drawing-no", "171", "--qty", "1", "--price", "15",
+                  "--date", "2026-08-07")
+        out = self.margin("--from", "2026-08-01", "--to", "2026-08-10")
+        self.assertEqual([r["customer"] for r in out["by_customer"]], ["乙店", None],
+                         "现结售出归入 customer=null 组，毛利降序")
+        yi, cash = out["by_customer"][0], out["by_customer"][1]
+        self.assertEqual(yi, {"customer": "乙店", "amount": 80.0, "cost": 20.0,
+                              "margin": 60.0, "margin_rate": 0.75})
+        self.assertEqual(cash, {"customer": None, "amount": 15.0, "cost": 6.0,
+                                "margin": 9.0, "margin_rate": 0.6})
+
+    def test_margin_filter_by_product(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                  "--customer", "乙店", "--date", "2026-08-05")
+        self.sale("--drawing-no", "171", "--qty", "2", "--price", "30",
+                  "--date", "2026-08-06")
+        out = self.margin("--from", "2026-08-01", "--to", "2026-08-10",
+                          "--product", "170")
+        self.assertEqual(out["amount"], 45.0)
+        self.assertEqual(out["cost"], 12.0)
+        self.assertEqual([r["drawing_no"] for r in out["by_product"]], ["170"])
+        self.assertEqual([r["customer"] for r in out["by_customer"]], ["乙店"])
+
+    def test_margin_filter_by_customer(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                  "--customer", "乙店", "--date", "2026-08-05")
+        self.sale("--drawing-no", "171", "--qty", "2", "--price", "30",
+                  "--customer", "丙店", "--date", "2026-08-06")
+        out = self.margin("--from", "2026-08-01", "--to", "2026-08-10",
+                          "--customer", "乙店")
+        self.assertEqual(out["amount"], 45.0)
+        self.assertEqual([r["drawing_no"] for r in out["by_product"]], ["170"])
+        self.assertEqual([r["customer"] for r in out["by_customer"]], ["乙店"])
+
+    def test_margin_unknown_product_exit1(self):
+        self._seed()
+        cp = self.fairy("query", "margin", "--from", "2026-08-01", "--to", "2026-08-10",
+                        "--product", "NOPE")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("无此商品", cp.stderr)
+
+    def test_margin_unknown_customer_empty(self):
+        self._seed()
+        out = self.margin("--from", "2026-08-01", "--to", "2026-08-10",
+                          "--customer", "没买过")
+        self.assertEqual(out["amount"], 0.0)
+        self.assertEqual(out["by_customer"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

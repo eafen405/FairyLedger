@@ -1,5 +1,6 @@
 """流水、库存成本与挂账对账：进货/售出/期初录入/收付款/红冲/修改写入、
-当前库存与移动加权均价、挂账欠款现算、单产品流水（spec D2/D5/D6 + ADR 0001/0004）。
+当前库存与移动加权均价、挂账欠款现算、单产品流水、日报与期间毛利
+（spec D2/D5/D6 + ADR 0001/0004）。
 
 - 写入命令（purchase/sale/opening/receive/pay/reverse/edit）单事务原子：
   商品查证、往来单位解析、流水落库、审计日志一体，中途失败不留半截数据。
@@ -560,6 +561,35 @@ def query_price(
     return rows
 
 
+def _credit_balances(
+    conn: sqlite3.Connection, name: str | None = None
+) -> list[dict[str, Any]]:
+    """全部挂账单位期末欠款（= 挂账交易累计 − 收付款累计，全历史现算，spec D6）。
+
+    退货（purchase_return/sale_return）按负金额计入（T5 定案）；未挂账单位不进
+    总览；欠款降序。query credit 总览与日报挂账块余额共用同一现算逻辑。
+    """
+    bal_sql = (
+        "SELECT cp.name AS counterparty,"
+        " COALESCE((SELECT SUM(CASE WHEN t.biz_type IN ('purchase_return', 'sale_return')"
+        "                          THEN -t.qty * t.price ELSE t.qty * t.price END)"
+        "           FROM transactions t WHERE t.counterparty_id = cp.id), 0)"
+        " - COALESCE((SELECT SUM(p.amount) FROM payments p"
+        "             WHERE p.counterparty_id = cp.id), 0) AS balance"
+        " FROM counterparties cp WHERE cp.is_credit = 1"
+    )
+    params: list[Any] = []
+    if name:
+        bal_sql += " AND cp.name = ? COLLATE NOCASE"
+        params.append(name)
+    balances = [
+        {"counterparty": r["counterparty"], "balance": round(r["balance"], ROUND)}
+        for r in conn.execute(bal_sql, params).fetchall()
+    ]
+    balances.sort(key=lambda b: (-b["balance"], b["counterparty"]))
+    return balances
+
+
 def query_credit(
     conn: sqlite3.Connection,
     counterparty: str | None = None,
@@ -620,25 +650,7 @@ def query_credit(
         for r in conn.execute(sql, params).fetchall()
     ]
 
-    bal_sql = (
-        "SELECT cp.name AS counterparty,"
-        " COALESCE((SELECT SUM(CASE WHEN t.biz_type IN ('purchase_return', 'sale_return')"
-        "                          THEN -t.qty * t.price ELSE t.qty * t.price END)"
-        "           FROM transactions t WHERE t.counterparty_id = cp.id), 0)"
-        " - COALESCE((SELECT SUM(p.amount) FROM payments p"
-        "             WHERE p.counterparty_id = cp.id), 0) AS balance"
-        " FROM counterparties cp WHERE cp.is_credit = 1"
-    )
-    bal_params: list[Any] = []
-    if name:
-        bal_sql += " AND cp.name = ? COLLATE NOCASE"
-        bal_params.append(name)
-    balances = [
-        {"counterparty": r["counterparty"], "balance": round(r["balance"], ROUND)}
-        for r in conn.execute(bal_sql, bal_params).fetchall()
-    ]
-    balances.sort(key=lambda b: (-b["balance"], b["counterparty"]))
-    return {"records": records, "balances": balances}
+    return {"records": records, "balances": _credit_balances(conn, name)}
 
 
 def query_history(
@@ -700,6 +712,279 @@ def query_history(
             }
         )
     return rows
+
+
+def report_daily(
+    conn: sqlite3.Connection, date: str | None = None
+) -> dict[str, Any]:
+    """日报（spec D6 四块，结构化 JSON，Fairy 以文字消息发四块，不产文件）。
+
+    默认昨天；无业务日照发（汇总为零、异常区为空）；查询/报告类天然可重跑、
+    无写入副作用。
+    1. 当日汇总：进货/售出（笔数/总金额，当日退货净额冲减）、运费合计（全部流水
+       freight 求和，退货 freight=0）、毛利合计 = 售出净额 − 成本快照净额
+       （售出退货冲减当期毛利，D2；运费不进毛利）。
+    2. 挂账变动（口径已确认）：新增挂账额 = 当日挂账单位交易净额（进货/售出正金额、
+       退货负金额，与对账单 records 同口径）；收款/付款合计只算挂账单位的收付款；
+       余额 = 全部挂账单位全历史现算（复用 _credit_balances）。
+    3. 流水明细：当日进货+售出+退货逐笔（录入序），退货行带「红冲」ref 原单标记。
+    4. 异常提醒：仅金额异常——当日售出单价偏离该商品上次成交价（商品全局、
+       严格更早的最近一笔成交价，口径已确认）±30% 的流水列出供核对；
+       无上次成交价或基准价为 0（无有效基准）时不判定；不设负库存提醒。
+    """
+    if date is None:
+        biz_date = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    else:
+        biz_date = date.strip()
+        if not DATE_RE.match(biz_date):
+            raise BusinessError("日期格式应为 YYYY-MM-DD")
+
+    tx_rows = conn.execute(
+        "SELECT biz_type, qty, price, freight, cost FROM transactions"
+        " WHERE biz_date = ? AND biz_type IN"
+        " ('purchase', 'sale', 'purchase_return', 'sale_return')",
+        (biz_date,),
+    ).fetchall()
+
+    def _net(kind: str, ret_kind: str) -> tuple[int, float, float]:
+        count = 0
+        amount = 0.0
+        cost = 0.0
+        for t in tx_rows:
+            if t["biz_type"] == kind:
+                sign = 1
+            elif t["biz_type"] == ret_kind:
+                sign = -1
+            else:
+                continue
+            count += sign
+            amount += sign * t["qty"] * t["price"]
+            cost += sign * t["qty"] * (t["cost"] or 0.0)
+        return count, amount, cost
+
+    p_count, p_amount, _ = _net("purchase", "purchase_return")
+    s_count, s_amount, s_cost = _net("sale", "sale_return")
+    freight = round(sum((t["freight"] or 0.0) for t in tx_rows), ROUND)
+
+    new_credit = conn.execute(
+        "SELECT COALESCE(SUM(CASE WHEN t.biz_type IN ('purchase_return', 'sale_return')"
+        "                        THEN -t.qty * t.price ELSE t.qty * t.price END), 0)"
+        " FROM transactions t JOIN counterparties cp ON cp.id = t.counterparty_id"
+        " WHERE cp.is_credit = 1 AND t.biz_date = ?"
+        "   AND t.biz_type IN ('purchase', 'sale', 'purchase_return', 'sale_return')",
+        (biz_date,),
+    ).fetchone()[0]
+    received = conn.execute(
+        "SELECT COALESCE(SUM(p.amount), 0) FROM payments p"
+        " JOIN counterparties cp ON cp.id = p.counterparty_id"
+        " WHERE cp.is_credit = 1 AND p.pay_type = 'receive' AND p.pay_date = ?",
+        (biz_date,),
+    ).fetchone()[0]
+    paid = conn.execute(
+        "SELECT COALESCE(SUM(p.amount), 0) FROM payments p"
+        " JOIN counterparties cp ON cp.id = p.counterparty_id"
+        " WHERE cp.is_credit = 1 AND p.pay_type = 'pay' AND p.pay_date = ?",
+        (biz_date,),
+    ).fetchone()[0]
+    balance = round(sum(b["balance"] for b in _credit_balances(conn)), ROUND)
+
+    details = []
+    for r in conn.execute(
+        "SELECT t.id, t.biz_date, t.biz_type, t.qty, t.price, t.ref_id,"
+        "       p.drawing_no, p.name, p.unit, cp.name AS counterparty,"
+        "       o.biz_date AS ref_biz_date, o.biz_type AS ref_biz_type"
+        " FROM transactions t"
+        " JOIN products p ON p.id = t.product_id"
+        " LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
+        " LEFT JOIN transactions o ON o.id = t.ref_id"
+        " WHERE t.biz_date = ? AND t.biz_type IN"
+        " ('purchase', 'sale', 'purchase_return', 'sale_return')"
+        " ORDER BY t.id",
+        (biz_date,),
+    ).fetchall():
+        details.append(
+            {
+                "id": r["id"],
+                "biz_date": r["biz_date"],
+                "biz_type": r["biz_type"],
+                "drawing_no": r["drawing_no"],
+                "name": r["name"],
+                "unit": r["unit"],
+                "qty": round(r["qty"], ROUND),
+                "price": r["price"],
+                "amount": round(r["qty"] * r["price"], ROUND),
+                "counterparty": r["counterparty"],
+                "ref": (
+                    {"id": r["ref_id"], "biz_date": r["ref_biz_date"],
+                     "biz_type": r["ref_biz_type"]}
+                    if r["ref_id"] is not None else None
+                ),
+            }
+        )
+
+    alerts = []
+    for r in conn.execute(
+        "SELECT t.id, t.product_id, t.qty, t.price, t.biz_date,"
+        "       p.drawing_no, p.name"
+        " FROM transactions t JOIN products p ON p.id = t.product_id"
+        " WHERE t.biz_date = ? AND t.biz_type = 'sale' ORDER BY t.id",
+        (biz_date,),
+    ).fetchall():
+        last = conn.execute(
+            "SELECT price FROM transactions"
+            " WHERE biz_type = 'sale' AND product_id = ?"
+            "   AND (biz_date < ? OR (biz_date = ? AND id < ?))"
+            " ORDER BY biz_date DESC, id DESC LIMIT 1",
+            (r["product_id"], r["biz_date"], r["biz_date"], r["id"]),
+        ).fetchone()
+        if last is None or last["price"] == 0:
+            continue
+        deviation = (r["price"] - last["price"]) / last["price"]
+        if abs(deviation) >= 0.3:
+            alerts.append(
+                {
+                    "id": r["id"],
+                    "drawing_no": r["drawing_no"],
+                    "name": r["name"],
+                    "qty": round(r["qty"], ROUND),
+                    "price": r["price"],
+                    "last_price": last["price"],
+                    "deviation": round(deviation, ROUND),
+                }
+            )
+
+    return {
+        "date": biz_date,
+        "summary": {
+            "purchase": {"count": p_count, "amount": round(p_amount, ROUND)},
+            "sale": {"count": s_count, "amount": round(s_amount, ROUND)},
+            "freight": freight,
+            "margin": round(s_amount - s_cost, ROUND),
+        },
+        "credit": {
+            "new_credit": round(new_credit, ROUND),
+            "received": round(received, ROUND),
+            "paid": round(paid, ROUND),
+            "balance": balance,
+        },
+        "details": details,
+        "alerts": alerts,
+    }
+
+
+def query_margin(
+    conn: sqlite3.Connection,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    product: str | None = None,
+    customer: str | None = None,
+) -> dict[str, Any]:
+    """期间毛利报表（spec D5/D6）：金额/成本/毛利/毛利率 + 按产品/客户分组。
+
+    - 期间：--from/--to 成对给出、缺省默认本月（1 号至今天）；格式校验 + 起≤止。
+    - 口径：期间售出金额/成本 = sale 正、sale_return 负（售出退货按原单冲减当期，
+      sale_return 行在期间内即计入，负方向）；毛利 = 金额 − 成本（快照合计）；
+      毛利率 = 毛利 ÷ 售出金额（无售出时 null）。
+    - 分组：按产品（图号/名称）与按客户（现结归入 customer=null 组），均为
+      金额/成本/毛利/毛利率、毛利降序；--product/--customer 过滤作用于全报表。
+    """
+    today = datetime.date.today()
+    if from_date is None and to_date is None:
+        from_date = f"{today.year:04d}-{today.month:02d}-01"
+        to_date = today.isoformat()
+    elif from_date is None or to_date is None:
+        raise BusinessError("参数缺失: --from 与 --to 须成对给出（缺省默认本月）")
+    else:
+        from_date, to_date = from_date.strip(), to_date.strip()
+        if not (DATE_RE.match(from_date) and DATE_RE.match(to_date)):
+            raise BusinessError("日期格式应为 YYYY-MM-DD")
+        if from_date > to_date:
+            raise BusinessError("起始日期不能晚于截止日期")
+
+    product_id = None
+    if product:
+        product_id = _require_product(conn, (product or "").strip())["id"]
+    cp_id: int | None = None
+    if customer:
+        customer = customer.strip()
+        row = conn.execute(
+            "SELECT id FROM counterparties WHERE name = ? COLLATE NOCASE", (customer,)
+        ).fetchone()
+        cp_id = row["id"] if row is not None else -1  # 无此客户 → 过滤后空结果
+
+    cond = "t.biz_date BETWEEN ? AND ?"
+    params: list[Any] = [from_date, to_date]
+    if product_id is not None:
+        cond += " AND t.product_id = ?"
+        params.append(product_id)
+    if cp_id is not None:
+        cond += " AND t.counterparty_id = ?"
+        params.append(cp_id)
+
+    amount = 0.0
+    cost = 0.0
+    for t in conn.execute(
+        f"SELECT biz_type, qty, price, cost FROM transactions t"
+        f" WHERE t.biz_type IN ('sale', 'sale_return') AND {cond}",
+        params,
+    ).fetchall():
+        sign = -1 if t["biz_type"] == "sale_return" else 1
+        amount += sign * t["qty"] * t["price"]
+        cost += sign * t["qty"] * (t["cost"] or 0.0)
+
+    amount_sql = (
+        "SUM(CASE WHEN t.biz_type = 'sale' THEN t.qty * t.price"
+        "         ELSE -t.qty * t.price END)"
+    )
+    cost_sql = (
+        "SUM(CASE WHEN t.biz_type = 'sale' THEN t.qty * COALESCE(t.cost, 0)"
+        "         ELSE -t.qty * COALESCE(t.cost, 0) END)"
+    )
+
+    def _margin_rows(sql: str, params: list[Any]) -> list[dict[str, Any]]:
+        rows = []
+        for r in conn.execute(sql, params).fetchall():
+            g_amount = r["amount"]
+            g_cost = r["cost"]
+            g_margin = g_amount - g_cost
+            row = dict(r)
+            row.pop("amount", None)
+            row.pop("cost", None)
+            row["amount"] = round(g_amount, ROUND)
+            row["cost"] = round(g_cost, ROUND)
+            row["margin"] = round(g_margin, ROUND)
+            row["margin_rate"] = round(g_margin / g_amount, ROUND) if g_amount else None
+            rows.append(row)
+        return rows
+
+    by_product = _margin_rows(
+        f"SELECT p.drawing_no, p.name, {amount_sql} AS amount, {cost_sql} AS cost"
+        f" FROM transactions t JOIN products p ON p.id = t.product_id"
+        f" WHERE t.biz_type IN ('sale', 'sale_return') AND {cond}"
+        f" GROUP BY t.product_id",
+        params,
+    )
+    by_product.sort(key=lambda g: (-g["margin"], g["drawing_no"]))
+    by_customer = _margin_rows(
+        f"SELECT cp.name AS customer, {amount_sql} AS amount, {cost_sql} AS cost"
+        f" FROM transactions t LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
+        f" WHERE t.biz_type IN ('sale', 'sale_return') AND {cond}"
+        f" GROUP BY cp.name",
+        params,
+    )
+    by_customer.sort(key=lambda g: (-g["margin"], g["customer"] or ""))
+
+    margin = amount - cost
+    return {
+        "from": from_date,
+        "to": to_date,
+        "amount": round(amount, ROUND),
+        "cost": round(cost, ROUND),
+        "margin": round(margin, ROUND),
+        "margin_rate": round(margin / amount, ROUND) if amount else None,
+        "by_product": by_product,
+        "by_customer": by_customer,
+    }
 
 
 def record_opening(

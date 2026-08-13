@@ -104,6 +104,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_history.add_argument("--drawing-no", help="图号（必填）")
     p_history.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
     p_history.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
+    p_margin = p_query_sub.add_parser("margin", help="期间毛利（默认本月，可过滤产品/客户）")
+    p_margin.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
+    p_margin.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
+    p_margin.add_argument("--product", help="按图号过滤")
+    p_margin.add_argument("--customer", help="按客户过滤")
+
+    p_report = sub.add_parser("report", help="报告")
+    p_report_sub = p_report.add_subparsers(dest="subcommand", metavar="<子命令>")
+    p_daily = p_report_sub.add_parser(
+        "daily", help="日报（默认昨天，输出结构化 JSON 四块，Fairy 发文字消息，不产文件）"
+    )
+    p_daily.add_argument("--date", help="业务日期 YYYY-MM-DD，缺省昨天")
     return parser
 
 
@@ -187,6 +199,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if not q:
                     raise BusinessError("参数缺失: --q")
                 _emit(products.search_products(conn, q))
+            elif args.command == "query" and args.subcommand == "margin":
+                _emit(ledger.query_margin(conn, args.from_date, args.to_date,
+                                          args.product, args.customer))
+            elif args.command == "report" and args.subcommand == "daily":
+                _emit(ledger.report_daily(conn, args.date))
             else:
                 detail = getattr(args, "subcommand", None)
                 raise BusinessError(
