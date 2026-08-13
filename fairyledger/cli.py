@@ -72,6 +72,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_pay.add_argument("--date", help="业务日期 YYYY-MM-DD，缺省今天")
     p_pay.add_argument("--note", help="备注，可空")
 
+    p_reverse = sub.add_parser("reverse", help="红冲（关联原单，按原单成本冲）")
+    p_reverse.add_argument("--tx", type=int, help="原单流水 id（必填）")
+    p_reverse.add_argument("--date", help="业务日期 YYYY-MM-DD，缺省今天")
+    p_reverse.add_argument("--note", help="备注，可空")
+
+    p_edit = sub.add_parser("edit", help="修改（部分更新，触发审计）")
+    p_edit.add_argument("--tx", type=int, help="流水 id（必填）")
+    p_edit.add_argument("--qty", type=float, help="数量（正数）")
+    p_edit.add_argument("--price", type=float, help="单价（不能为负）")
+    p_edit.add_argument("--customer", help="往来单位名称；不存在自动建档")
+    p_edit.add_argument("--date", help="业务日期 YYYY-MM-DD")
+    p_edit.add_argument("--note", help="备注")
+
     p_query = sub.add_parser("query", help="查询")
     p_query_sub = p_query.add_subparsers(dest="subcommand", metavar="<子命令>")
     p_stock = p_query_sub.add_parser("stock", help="当前库存")
@@ -87,6 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_credit.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
     p_search = p_query_sub.add_parser("product", help="商品检索（歧义消解）")
     p_search.add_argument("--q", help="检索词：图号精确优先，否则词段 AND 匹配")
+    p_history = p_query_sub.add_parser("history", help="单产品全部流水（进货/售出/红冲逐笔）")
+    p_history.add_argument("--drawing-no", help="图号（必填）")
+    p_history.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
+    p_history.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
     return parser
 
 
@@ -147,6 +164,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _emit(ledger.record_payment(
                     conn, "pay", args.counterparty, args.amount, args.date, args.note,
                 ))
+            elif args.command == "reverse":
+                _emit(ledger.record_reverse(conn, args.tx, args.date, args.note))
+            elif args.command == "edit":
+                _emit(ledger.edit_transaction(
+                    conn, args.tx, args.qty, args.price,
+                    args.customer, args.date, args.note,
+                ))
             elif args.command == "query" and args.subcommand == "stock":
                 _emit(ledger.query_stock(conn, args.drawing_no))
             elif args.command == "query" and args.subcommand == "price":
@@ -155,6 +179,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.command == "query" and args.subcommand == "credit":
                 _emit(ledger.query_credit(conn, args.counterparty,
                                           args.from_date, args.to_date))
+            elif args.command == "query" and args.subcommand == "history":
+                _emit(ledger.query_history(conn, args.drawing_no,
+                                           args.from_date, args.to_date))
             elif args.command == "query" and args.subcommand == "product":
                 q = (args.q or "").strip()
                 if not q:

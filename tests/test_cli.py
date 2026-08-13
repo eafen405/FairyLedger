@@ -138,6 +138,28 @@ class T1Base(unittest.TestCase):
         self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
         return json.loads(cp.stdout)
 
+    def reverse(self, *args: str) -> dict:
+        cp = self.fairy("reverse", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def edit(self, *args: str) -> dict:
+        cp = self.fairy("edit", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def history_rows(self, *args: str) -> list[dict]:
+        cp = self.fairy("query", "history", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def audit_rows(self) -> list[tuple]:
+        """只读核对 audit_log（spec Testing Decisions：无 CLI 暴露处允许只读打开核对）。"""
+        return self.query_db(
+            "SELECT id, table_name, record_id, action, before_json, after_json, note"
+            " FROM audit_log ORDER BY id"
+        )
+
 
 class TestSchemaInit(T1Base):
     def test_empty_db_initializes_all_tables_and_indexes(self):
@@ -970,11 +992,460 @@ class TestQueryCredit(T1Base):
         self.assertEqual(out["balances"], [{"counterparty": "乙店", "balance": 0.0}],
                          "挂账单位欠款清零后仍在总览（余额 0）")
 
+    def test_sale_return_reduces_credit_balance(self):
+        # T5 定案：挂账客户售出退货按负金额冲减欠款（余额与对账单同口径）
+        self._seed()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "10",
+                      "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        self.reverse("--tx", str(s["id"]), "--date", "2026-08-02")
+        out = self.credit_rows()
+        self.assertEqual(out["balances"], [{"counterparty": "乙店", "balance": 0.0}],
+                         "售出退货后欠款冲减回零")
+        self.assertEqual([(r["date"], r["doc_type"], r["amount"]) for r in out["records"]],
+                         [("2026-08-01", "sale", 30.0),
+                          ("2026-08-02", "sale_return", -30.0)],
+                         "对账单退货行金额为负")
+
+    def test_purchase_return_reduces_credit_balance(self):
+        # 挂账供应商进货后退货，欠供应商款相应减少
+        self._seed()
+        p = self.purchase("--drawing-no", "170", "--qty", "2", "--price", "20",
+                          "--supplier", "甲厂", "--date", "2026-08-01")
+        # 甲厂挂账：进货打供应商标记后，再收款侧无法置挂账；用 --credit 售出给甲厂打通挂账标记
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "5",
+                  "--customer", "甲厂", "--credit", "--date", "2026-08-02")
+        self.reverse("--tx", str(p["id"]), "--date", "2026-08-03")
+        out = self.credit_rows()
+        self.assertEqual(out["balances"], [{"counterparty": "甲厂", "balance": 5.0}],
+                         "进货 40 − 退货 40 + 售出 5 = 5")
+        self.assertEqual([(r["date"], r["doc_type"], r["amount"]) for r in out["records"]],
+                         [("2026-08-01", "purchase", 40.0),
+                          ("2026-08-02", "sale", 5.0),
+                          ("2026-08-03", "purchase_return", -40.0)])
+
     def test_invalid_date_rejected(self):
         self._seed()
         cp = self.fairy("query", "credit", "--from", "2026/08/01")
         self.assertEqual(cp.returncode, 1)
         self.assertIn("日期格式", cp.stderr)
+
+
+class TestReverse(T1Base):
+    """T5 红冲（spec D2/D5）：进货→purchase_return 按原进货价冲减、均价重算；
+    售出→sale_return 按原成本快照回库、收入成本同冲；原单保留、ref_id 关联；
+    单事务原子；每次 reverse 落审计日志（整行 before/after）。"""
+
+    def _seed_product(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+
+    def _seed_stock(self):
+        self._seed_product()
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+
+    def test_reverse_requires_tx(self):
+        self._seed_product()
+        for args in ((), ("--date", "2026-08-01")):
+            cp = self.fairy("reverse", *args)
+            self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+            self.assertIn("参数缺失", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 0)
+
+    def test_reverse_unknown_tx_exit1_atomic(self):
+        self._seed_product()
+        cp = self.fairy("reverse", "--tx", "999")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("无此流水", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 0)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0,
+                         "红冲失败不应留审计")
+
+    def test_purchase_return_basic(self):
+        self._seed_product()
+        p = self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10")
+        out = self.reverse("--tx", str(p["id"]))
+        self.assertEqual(out["biz_type"], "purchase_return", "进货退货类型")
+        self.assertEqual(out["qty"], 5.0)
+        self.assertEqual(out["price"], 10.0, "退货价 = 原单价格")
+        self.assertEqual(out["ref_id"], p["id"], "红冲必须关联原单")
+        self.assertEqual(out["biz_date"], datetime.date.today().isoformat(), "日期缺省今天")
+        self.assertIsNone(out["cost"], "进货退货无成本快照")
+        self.assertEqual(out["drawing_no"], "170")
+        self.assertIn("audit_id", out)
+        self.assertEqual(self.query_db(
+            "SELECT biz_type, qty, price FROM transactions WHERE id = ?", p["id"]),
+            [("purchase", 5.0, 10.0)], "原单保留不动")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 0.0, "数量按原进货量红字冲减")
+        self.assertEqual(row["amount"], 0.0)
+
+    def test_purchase_return_recomputes_average(self):
+        self._seed_stock()
+        p = self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10")  # 均价 → 6
+        self.reverse("--tx", str(p["id"]))
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 10.0)
+        self.assertEqual(row["unit_cost"], 4.0, "进货退货按原进货价冲减、均价重算回期初")
+        self.assertEqual(row["amount"], 40.0)
+
+    def test_sale_return_restores_stock_at_cost_snapshot(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")  # 快照 cost 4
+        out = self.reverse("--tx", str(s["id"]))
+        self.assertEqual(out["biz_type"], "sale_return")
+        self.assertEqual(out["qty"], 3.0)
+        self.assertEqual(out["price"], 15.0, "退货价 = 原售出价")
+        self.assertEqual(out["cost"], 4.0, "按原售出单成本快照回库")
+        self.assertEqual(out["ref_id"], s["id"])
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 10.0, "货退回库存")
+        self.assertEqual(row["unit_cost"], 4.0)
+        self.assertEqual(row["amount"], 40.0)
+
+    def test_sale_return_uses_original_snapshot_not_current_avg(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")  # cost 4
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10")   # 均价 → 6.5
+        out = self.reverse("--tx", str(s["id"]))
+        self.assertEqual(out["cost"], 4.0, "回库按原单成本快照，不是当前均价 6.5")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 15.0, "10-3+5+3")
+        self.assertEqual(row["amount"], 90.0, "40-12+50+12")
+        self.assertEqual(row["unit_cost"], 6.0)
+
+    def test_reverse_with_date_and_note(self):
+        self._seed_product()
+        p = self.purchase("--drawing-no", "170", "--qty", "2", "--price", "50")
+        out = self.reverse("--tx", str(p["id"]), "--date", "2026-08-05", "--note", "厂家召回")
+        self.assertEqual(out["biz_date"], "2026-08-05")
+        self.assertEqual(out["note"], "厂家召回")
+
+    def test_reverse_invalid_date_rejected_atomic(self):
+        self._seed_product()
+        p = self.purchase("--drawing-no", "170", "--qty", "2", "--price", "50")
+        cp = self.fairy("reverse", "--tx", str(p["id"]), "--date", "2026/08/05")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("日期格式", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 1,
+                         "失败不应新增退货流水")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0)
+
+    def test_reverse_only_original_purchase_or_sale(self):
+        self._seed_product()
+        p = self.purchase("--drawing-no", "170", "--qty", "2", "--price", "50")
+        r = self.reverse("--tx", str(p["id"]))
+        self.assertEqual(r["biz_type"], "purchase_return")
+        cp = self.fairy("reverse", "--tx", str(r["id"]))
+        self.assertEqual(cp.returncode, 1, "不能红冲退货单本身")
+        self.assertIn("仅支持红冲进货/售出原单", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 2,
+                         "失败不新增任何流水")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 1,
+                         "失败不新增审计")
+
+    def test_reverse_twice_rejected(self):
+        # T5 定案：一单一冲——原单已有退货行再红冲 → 业务错误，防货重复回库
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        self.reverse("--tx", str(s["id"]))
+        cp = self.fairy("reverse", "--tx", str(s["id"]))
+        self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+        self.assertIn("已红冲", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 2,
+                         "失败不新增第二次退货流水")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 1,
+                         "失败不新增审计")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 10.0, "货只回库一次")
+
+    def test_reverse_output_carries_original(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        out = self.reverse("--tx", str(s["id"]))
+        self.assertEqual(out["original"], {
+            "id": s["id"], "biz_date": s["biz_date"], "biz_type": "sale",
+            "qty": 3.0, "price": 15.0, "cost": 4.0,
+        }, "输出带原单信息供 Fairy 回显")
+
+    def test_reverse_writes_audit_before_after(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        out = self.reverse("--tx", str(s["id"]))
+        rows = self.audit_rows()
+        self.assertEqual(len(rows), 1)
+        audit_id, table, record_id, action, before, after, note = rows[0]
+        self.assertEqual((table, record_id, action), ("transactions", s["id"], "reverse"))
+        self.assertIn("reverse", note)
+        self.assertEqual(out["audit_id"], audit_id)
+        before_d, after_d = json.loads(before), json.loads(after)
+        self.assertEqual(set(before_d), TRANSACTION_COLUMNS, "审计含整行 before 快照")
+        self.assertEqual(set(after_d), TRANSACTION_COLUMNS, "审计含整行 after 快照")
+        self.assertEqual(before_d["id"], s["id"])
+        self.assertEqual(before_d["biz_type"], "sale")
+        self.assertEqual(before_d["qty"], 3.0)
+        self.assertEqual(after_d["id"], out["id"])
+        self.assertEqual(after_d["biz_type"], "sale_return")
+        self.assertEqual(after_d["ref_id"], s["id"])
+        self.assertEqual(after_d["cost"], 4.0)
+
+
+class TestEdit(T1Base):
+    """T5 修改（spec D5）：部分更新、不允许改图号（CLI 无该参数，结构性禁止）、
+    改售出 qty/price 不改成本快照；每次修改写审计（整行 before/after，可完整还原）。"""
+
+    def _seed_stock(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+
+    def test_edit_requires_tx(self):
+        self._seed_stock()
+        cp = self.fairy("edit", "--qty", "2")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("参数缺失", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0)
+
+    def test_edit_unknown_tx_exit1_atomic(self):
+        self._seed_stock()
+        cp = self.fairy("edit", "--tx", "999", "--qty", "2")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("无此流水", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0)
+
+    def test_edit_no_fields_exit1(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        cp = self.fairy("edit", "--tx", str(s["id"]))
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("参数缺失", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0,
+                         "空修改不应写审计")
+
+    def test_edit_partial_update_qty_price_keeps_cost(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        out = self.edit("--tx", str(s["id"]), "--qty", "2", "--price", "20")
+        self.assertEqual(out["qty"], 2.0)
+        self.assertEqual(out["price"], 20.0)
+        self.assertEqual(out["cost"], 4.0, "改售出 qty/price 不改成本快照")
+        self.assertEqual(out["changed"], ["qty", "price"])
+        self.assertIn("audit_id", out)
+        self.assertEqual(out["drawing_no"], "170", "不允许改商品，图号保持原值")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 8.0, "改数量后库存现算跟随")
+        self.assertEqual(row["unit_cost"], 4.0)
+
+    def test_edit_price_only_other_fields_unchanged(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                      "--customer", "乙店", "--date", "2026-08-01", "--note", "原单")
+        out = self.edit("--tx", str(s["id"]), "--price", "12")
+        self.assertEqual(out["price"], 12.0)
+        self.assertEqual(out["qty"], 3.0, "只改传了的字段")
+        self.assertEqual(out["customer"], "乙店")
+        self.assertEqual(out["biz_date"], "2026-08-01")
+        self.assertEqual(out["note"], "原单")
+
+    def test_edit_customer_create_or_resolve(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        out = self.edit("--tx", str(s["id"]), "--customer", "乙店")
+        self.assertEqual(out["customer"], "乙店")
+        self.assertEqual(self.query_db(
+            "SELECT name, is_customer, is_supplier, is_credit FROM counterparties"),
+            [("乙店", 1, 0, 0)], "新客户自动建档并打客户标记")
+
+    def test_edit_purchase_customer_marks_supplier(self):
+        self._seed_stock()
+        p = self.purchase("--drawing-no", "170", "--qty", "2", "--price", "50")
+        out = self.edit("--tx", str(p["id"]), "--customer", "甲厂")
+        self.assertEqual(out["supplier"], "甲厂", "进货单修改往来单位打供应商标记")
+        self.assertEqual(self.query_db(
+            "SELECT name, is_customer, is_supplier FROM counterparties"),
+            [("甲厂", 0, 1)])
+
+    def test_edit_date_and_invalid_date(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        out = self.edit("--tx", str(s["id"]), "--date", "2026-08-01")
+        self.assertEqual(out["biz_date"], "2026-08-01")
+        cp = self.fairy("edit", "--tx", str(s["id"]), "--date", "2026/08/01")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("日期格式", cp.stderr)
+        self.assertEqual(self.query_db(
+            "SELECT biz_date FROM transactions WHERE id = ?", s["id"])[0][0],
+            "2026-08-01", "失败不改动原行")
+
+    def test_edit_note_only(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        out = self.edit("--tx", str(s["id"]), "--note", "加急")
+        self.assertEqual(out["note"], "加急")
+        self.assertEqual(out["qty"], 3.0)
+        self.assertEqual(out["price"], 15.0)
+        self.assertEqual(out["changed"], ["note"])
+
+    def test_edit_qty_must_be_positive(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        for q in ("0", "-2"):
+            cp = self.fairy("edit", "--tx", str(s["id"]), "--qty", q)
+            self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+        self.assertEqual(self.query_db(
+            "SELECT qty FROM transactions WHERE id = ?", s["id"])[0][0], 3.0,
+            "失败不改动原行")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0,
+                         "校验失败不写审计")
+
+    def test_edit_negative_price_rejected(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        cp = self.fairy("edit", "--tx", str(s["id"]), "--price", "-5")
+        self.assertEqual(cp.returncode, 1)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0)
+
+    def test_edit_rejects_drawing_no_flag(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        cp = self.fairy("edit", "--tx", str(s["id"]), "--drawing-no", "171")
+        self.assertEqual(cp.returncode, 1, "edit 无图号参数：换商品走红冲+新单")
+        self.assertEqual(self.query_db(
+            "SELECT biz_type FROM transactions WHERE id = ?", s["id"])[0][0], "sale")
+
+    def test_edit_same_customer_noop_no_crash(self):
+        # 传的值与当前相同 → 无实际修改：业务错误（退出码 1，非系统错误 2），不写审计
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                      "--customer", "乙店")
+        cp = self.fairy("edit", "--tx", str(s["id"]), "--customer", "乙店")
+        self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+        self.assertIn("无实际修改", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0)
+        cp_id = self.query_db("SELECT id FROM counterparties WHERE name = '乙店'")[0][0]
+        self.assertEqual(self.query_db(
+            "SELECT counterparty_id FROM transactions WHERE id = ?", s["id"])[0][0],
+            cp_id, "往来单位保持原值")
+
+    def test_edit_same_value_qty_noop_no_audit(self):
+        # 传的值与当前相同（qty）→ 无实际修改：业务错误，不写 before==after 的审计噪音
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        cp = self.fairy("edit", "--tx", str(s["id"]), "--qty", "3")
+        self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+        self.assertIn("无实际修改", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0)
+
+
+    def test_edit_writes_audit_before_after(self):
+        self._seed_stock()
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                      "--note", "原备注")
+        out = self.edit("--tx", str(s["id"]), "--qty", "2", "--note", "改后")
+        rows = self.audit_rows()
+        self.assertEqual(len(rows), 1)
+        audit_id, table, record_id, action, before, after, note = rows[0]
+        self.assertEqual((table, record_id, action), ("transactions", s["id"], "update"))
+        self.assertIn("edit", note)
+        self.assertEqual(out["audit_id"], audit_id)
+        before_d, after_d = json.loads(before), json.loads(after)
+        self.assertEqual(set(before_d), TRANSACTION_COLUMNS, "before 为整行快照")
+        self.assertEqual(set(after_d), TRANSACTION_COLUMNS, "after 为整行快照")
+        self.assertEqual(before_d["qty"], 3.0)
+        self.assertEqual(before_d["note"], "原备注")
+        self.assertEqual(after_d["qty"], 2.0)
+        self.assertEqual(after_d["note"], "改后")
+        self.assertEqual(after_d["id"], s["id"])
+        self.assertEqual(after_d["cost"], 4.0, "成本快照不改")
+
+
+class TestHistory(T1Base):
+    """T5 单产品全部流水（spec D5/D6）：进货/售出/红冲逐笔、日期降序、
+    退货行带「红冲」关联原单标记（ref 原单信息）。"""
+
+    def _seed(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+        self.opening("--drawing-no", "170", "--qty", "100", "--cost", "4")
+
+    def test_history_requires_drawing_no(self):
+        self._seed()
+        cp = self.fairy("query", "history")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("参数缺失", cp.stderr)
+
+    def test_history_empty_for_unknown_product(self):
+        self._seed()
+        self.assertEqual(self.history_rows("--drawing-no", "NOPE"), [])
+
+    def test_history_lists_all_types_with_ref_marker(self):
+        self._seed()
+        p = self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10",
+                          "--date", "2026-08-01")
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                      "--date", "2026-08-05")
+        sr = self.reverse("--tx", str(s["id"]), "--date", "2026-08-06")
+        pr = self.reverse("--tx", str(p["id"]), "--date", "2026-08-07")
+        rows = self.history_rows("--drawing-no", "170")
+        self.assertEqual([r["biz_type"] for r in rows],
+                         ["purchase_return", "sale_return", "sale", "purchase"], "日期降序")
+        by_id = {r["id"]: r for r in rows}
+        ret = by_id[sr["id"]]
+        self.assertEqual(ret["ref_id"], s["id"])
+        self.assertEqual(ret["ref"],
+                         {"id": s["id"], "biz_date": "2026-08-05", "biz_type": "sale"},
+                         "退货行带「红冲」关联原单标记")
+        normal = by_id[s["id"]]
+        self.assertIsNone(normal["ref"], "普通行无红冲标记")
+        self.assertIsNone(normal["ref_id"])
+        self.assertEqual(by_id[pr["id"]]["ref"],
+                         {"id": p["id"], "biz_date": "2026-08-01", "biz_type": "purchase"})
+
+    def test_history_columns(self):
+        self._seed()
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10")
+        rows = self.history_rows("--drawing-no", "170")
+        self.assertEqual(set(rows[0]),
+                         {"id", "biz_date", "biz_type", "drawing_no", "name", "unit",
+                          "qty", "price", "amount", "freight", "cost", "counterparty",
+                          "note", "ref_id", "ref"})
+
+    def test_history_date_filter(self):
+        self._seed()
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10",
+                      "--date", "2026-08-01")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "15",
+                  "--date", "2026-08-10")
+        rows = self.history_rows("--drawing-no", "170", "--from", "2026-08-05")
+        self.assertEqual([r["biz_type"] for r in rows], ["sale"])
+        rows = self.history_rows("--drawing-no", "170", "--to", "2026-08-05")
+        self.assertEqual([r["biz_type"] for r in rows], ["purchase"])
+        rows = self.history_rows("--drawing-no", "170",
+                                 "--from", "2026-08-10", "--to", "2026-08-10")
+        self.assertEqual([r["biz_type"] for r in rows], ["sale"], "区间含边界")
+
+    def test_history_date_desc_order(self):
+        self._seed()
+        self.purchase("--drawing-no", "170", "--qty", "1", "--price", "10",
+                      "--date", "2026-08-01")
+        self.purchase("--drawing-no", "170", "--qty", "1", "--price", "30",
+                      "--date", "2026-08-02")
+        self.purchase("--drawing-no", "170", "--qty", "1", "--price", "20",
+                      "--date", "2026-08-03")
+        rows = self.history_rows("--drawing-no", "170")
+        self.assertEqual([r["biz_date"] for r in rows],
+                         ["2026-08-03", "2026-08-02", "2026-08-01"], "日期降序")
+
+    def test_history_invalid_date_rejected(self):
+        self._seed()
+        cp = self.fairy("query", "history", "--drawing-no", "170", "--from", "2026/08/01")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("日期格式", cp.stderr)
+
+    def test_history_amount_cost_columns(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        rows = self.history_rows("--drawing-no", "170")
+        sale_row = rows[0]
+        self.assertEqual(sale_row["amount"], 45.0, "金额 qty×price 现算")
+        self.assertEqual(sale_row["cost"], 4.0, "售出行含成本快照")
+        self.assertIsNone(sale_row["counterparty"])
 
 
 if __name__ == "__main__":

@@ -1,8 +1,15 @@
-"""流水、库存成本与挂账对账：进货/售出/期初录入/收付款写入、当前库存与移动加权均价、
-挂账欠款现算（spec D2/D6 + ADR 0001/0004）。
+"""流水、库存成本与挂账对账：进货/售出/期初录入/收付款/红冲/修改写入、
+当前库存与移动加权均价、挂账欠款现算、单产品流水（spec D2/D5/D6 + ADR 0001/0004）。
 
-- 写入命令（purchase/sale/opening/receive/pay）单事务原子：商品查证、往来单位解析、
-  流水落库一体，中途失败不留半截数据。
+- 写入命令（purchase/sale/opening/receive/pay/reverse/edit）单事务原子：
+  商品查证、往来单位解析、流水落库、审计日志一体，中途失败不留半截数据。
+- 红冲（reverse）：必须关联原单（ref_id）、按原单成本冲、退货价 = 原单价格——
+  进货→purchase_return（数量金额按原进货价红字冲减、均价重算、不直接冲当期毛利），
+  售出→sale_return（按原售出成本快照回库、收入成本同步冲减、毛利按该笔减少）；
+  原单保留不动，退货流水与审计日志同事务。
+- 修改（edit）：按 transaction id 定位、部分更新（传了哪些改哪些）；不允许改商品
+  （图号）——换商品走红冲 + 新单；改售出 qty/price 不改成本快照；每次修改自动写
+  审计日志（整行 before/after 快照，可完整还原，audit_log 无 CLI 暴露）。
 - 派生值一律现算（ADR 0001）：当前数量 = 期初合计 + 流水净量，当前加权均价 =
   结存金额 ÷ 结存数量，往来欠款 = 挂账交易累计 − 收付款累计，均不落列。
 - 加权平均公式：单位成本 =（进货前结存金额 + 本次进货金额）÷（进货前结存数量 +
@@ -13,6 +20,7 @@
 """
 
 import datetime
+import json
 import re
 import sqlite3
 from typing import Any
@@ -139,6 +147,48 @@ def _tx_with_product(
         "unit": product["unit"],
         **extra,
     }
+
+
+def _require_tx(conn: sqlite3.Connection, tx_id: int) -> sqlite3.Row:
+    """按 id 定位流水；不存在 → 业务错误「无此流水」（红冲/修改引用原单的入口）。"""
+    row = conn.execute("SELECT * FROM transactions WHERE id = ?", (tx_id,)).fetchone()
+    if row is None:
+        raise BusinessError(f"无此流水: {tx_id}")
+    return row
+
+
+def _counterparty_name(conn: sqlite3.Connection, cp_id: int | None) -> str | None:
+    """往来单位名称；无则 None。"""
+    if cp_id is None:
+        return None
+    row = conn.execute("SELECT name FROM counterparties WHERE id = ?", (cp_id,)).fetchone()
+    return row["name"] if row is not None else None
+
+
+def _write_audit(
+    conn: sqlite3.Connection,
+    table_name: str,
+    record_id: int,
+    action: str,
+    before: sqlite3.Row | dict | None,
+    after: sqlite3.Row | dict | None,
+    note: str | None = None,
+) -> int:
+    """写一行审计日志（spec D1）：改/删前整行 + 后整行 JSON 快照，可完整还原。
+
+    audit_log 无 CLI 暴露（spec Testing Decisions 允许测试只读核对）；
+    action 取值 update（edit）/ reverse（红冲），before/after 均为整行快照。
+    必须在调用方事务内执行，随业务写入同事务原子。
+    """
+    def _dump(row: sqlite3.Row | dict | None) -> str | None:
+        return json.dumps(dict(row), ensure_ascii=False) if row is not None else None
+
+    cur = conn.execute(
+        "INSERT INTO audit_log (table_name, record_id, action, before_json, after_json, note)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (table_name, record_id, action, _dump(before), _dump(after), note),
+    )
+    return cur.lastrowid
 
 
 def record_purchase(
@@ -285,6 +335,177 @@ def record_payment(
     return {**dict(row), "counterparty": counterparty}
 
 
+def record_reverse(
+    conn: sqlite3.Connection,
+    tx_id: int | None,
+    date: str | None,
+    note: str | None,
+) -> dict[str, Any]:
+    """红冲原单（spec D2/D5）：必须关联原单、按原单成本冲、退货价 = 原单价格。
+
+    - 进货原单 → purchase_return：数量与金额按原进货单价红字冲减，结存均价随之
+      重算（均价现算、随查随得），不直接冲减当期毛利（只减少后续可售成本）。
+    - 售出原单 → sale_return：按原售出成本快照（cost = 原单快照）把货退回库存，
+      收入与成本同步冲减，毛利按该笔减少。
+    - 原单保留不动，新退货流水 ref_id 关联原单；退货 freight 为 0（运费费用化，
+      退货不产生运费，金额 = qty×price 现算，spec D2 未定义退货运费）。
+    - 红冲致记录为负不硬拒（业务纪律非系统闸门）。
+    - 一单一冲：原单已被红冲（存在 ref_id 指向它的退货行）再红冲 → 业务错误
+      （T5 定案：防止重复红冲导致货重复回库）。
+    - 单事务原子：退货流水 + 审计日志（action=reverse，before=原单整行、
+      after=退货整行）同事务，中途失败不留半截。
+    """
+    if tx_id is None:
+        raise BusinessError("参数缺失: --tx")
+    biz_date = _normalize_date(date)
+    with conn:
+        orig = _require_tx(conn, tx_id)
+        if orig["biz_type"] not in ("purchase", "sale"):
+            raise BusinessError(
+                f"仅支持红冲进货/售出原单，该单类型: {orig['biz_type']}"
+            )
+        existing = conn.execute(
+            "SELECT id FROM transactions WHERE ref_id = ? LIMIT 1", (tx_id,)
+        ).fetchone()
+        if existing is not None:
+            raise BusinessError(
+                f"该原单已红冲: #{tx_id} → #{existing['id']}"
+            )
+        ret_type = (
+            "purchase_return" if orig["biz_type"] == "purchase" else "sale_return"
+        )
+        # 售出退货需携带原单成本快照供回库（_stock_state sale_return 分支按 cost 恢复）；
+        # 进货退货按原进货价冲减，无需成本快照列
+        cost = orig["cost"] if ret_type == "sale_return" else None
+        cur = conn.execute(
+            "INSERT INTO transactions"
+            " (biz_date, biz_type, product_id, qty, price, freight, cost,"
+            "  counterparty_id, ref_id, note)"
+            " VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+            (biz_date, ret_type, orig["product_id"], orig["qty"], orig["price"],
+             cost, orig["counterparty_id"], orig["id"], note),
+        )
+        ret_id = cur.lastrowid
+        ret = conn.execute(
+            "SELECT * FROM transactions WHERE id = ?", (ret_id,)
+        ).fetchone()
+        audit_id = _write_audit(
+            conn, "transactions", orig["id"], "reverse", orig, ret,
+            f"reverse transactions #{orig['id']} → #{ret_id} ({ret_type})",
+        )
+    product = conn.execute(
+        "SELECT drawing_no, name, unit FROM products WHERE id = ?",
+        (ret["product_id"],),
+    ).fetchone()
+    return _tx_with_product(
+        conn, ret_id, product,
+        counterparty=_counterparty_name(conn, ret["counterparty_id"]),
+        audit_id=audit_id,
+        original={
+            "id": orig["id"],
+            "biz_date": orig["biz_date"],
+            "biz_type": orig["biz_type"],
+            "qty": orig["qty"],
+            "price": orig["price"],
+            "cost": orig["cost"],
+        },
+    )
+
+
+def edit_transaction(
+    conn: sqlite3.Connection,
+    tx_id: int | None,
+    qty: float | None,
+    price: float | None,
+    customer: str | None,
+    date: str | None,
+    note: str | None,
+) -> dict[str, Any]:
+    """修改流水（spec D5 修改语义 + 审计）。
+
+    - 部分更新：传了哪些改哪些（可改 qty/price/customer/date/note）。
+    - 不允许改商品（图号）：CLI 无 --drawing-no 参数（结构性禁止），换商品 =
+      红冲 + 新单（换货语义）。
+    - 改售出单 qty/price 不改成本快照（cost 是售出时快照，改价只影响收入侧、
+      毛利随之变）；进货改 qty/price 是事实修改，均价随重放现算自然更新。
+    - 每次修改自动写审计日志（action=update，before/after 整行 JSON 快照，
+      可完整还原）；校验失败不写审计、不改行（单事务原子）。
+    - 无修改字段（只传 --tx）→ 业务错误，不写审计。
+    """
+    # 传了哪些改哪些：None = 未传；customer 空串视为未传（不支持清空往来单位）。
+    # changed 只在字段值实际变化时才记（同名往来单位/同值字段不产生 UPDATE，
+    # 也不写审计——audit 只记真实修改，避免 before==after 的永久无意义行）。
+    if tx_id is None:
+        raise BusinessError("参数缺失: --tx")
+    if qty is not None and qty <= 0:
+        raise BusinessError("数量必须为正数")
+    if price is not None and price < 0:
+        raise BusinessError("单价不能为负")
+    if date is not None and not DATE_RE.match(date.strip()):
+        raise BusinessError("日期格式应为 YYYY-MM-DD")
+    customer = (customer or "").strip() or None
+    biz_date = date.strip() if date is not None else None
+    if (
+        qty is None and price is None and customer is None
+        and biz_date is None and note is None
+    ):
+        raise BusinessError(
+            "参数缺失: 无修改字段（可改 --qty/--price/--customer/--date/--note）"
+        )
+    with conn:
+        orig = _require_tx(conn, tx_id)
+        cp_id = orig["counterparty_id"]
+        if customer is not None:
+            role_sale = orig["biz_type"] in ("sale", "sale_return")
+            cp_id = _resolve_counterparty(
+                conn, customer, customer=role_sale, supplier=not role_sale,
+            )
+        sets: list[str] = []
+        params: list[Any] = []
+        changed: list[str] = []
+        if qty is not None and qty != orig["qty"]:
+            sets.append("qty = ?")
+            params.append(qty)
+            changed.append("qty")
+        if price is not None and price != orig["price"]:
+            sets.append("price = ?")
+            params.append(price)
+            changed.append("price")
+        if cp_id != orig["counterparty_id"]:
+            sets.append("counterparty_id = ?")
+            params.append(cp_id)
+            changed.append("customer")
+        if biz_date is not None and biz_date != orig["biz_date"]:
+            sets.append("biz_date = ?")
+            params.append(biz_date)
+            changed.append("date")
+        if note is not None and note != orig["note"]:
+            sets.append("note = ?")
+            params.append(note)
+            changed.append("note")
+        if not sets:
+            raise BusinessError("无实际修改字段（提供的值与当前相同），未写入审计")
+        params.append(tx_id)
+        conn.execute(f"UPDATE transactions SET {', '.join(sets)} WHERE id = ?", params)
+        updated = conn.execute(
+            "SELECT * FROM transactions WHERE id = ?", (tx_id,)
+        ).fetchone()
+        audit_id = _write_audit(
+            conn, "transactions", tx_id, "update", orig, updated,
+            f"edit transactions #{tx_id}: {', '.join(changed)}",
+        )
+    product = conn.execute(
+        "SELECT drawing_no, name, unit FROM products WHERE id = ?",
+        (updated["product_id"],),
+    ).fetchone()
+    # 回显键随单类型：售出/售出退货 → customer，进货/进货退货 → supplier（与写入命令一致）
+    role_key = "customer" if updated["biz_type"] in ("sale", "sale_return") else "supplier"
+    extra = {role_key: _counterparty_name(conn, updated["counterparty_id"])}
+    return _tx_with_product(
+        conn, tx_id, product, audit_id=audit_id, changed=changed, **extra,
+    )
+
+
 def query_price(
     conn: sqlite3.Connection,
     drawing_no: str | None,
@@ -353,7 +574,9 @@ def query_credit(
       欠款降序；--counterparty 时只列该单位。
     - 挂账判定 = 往来单位档案 is_credit 标记（查询时现算）：档案挂账后该单位进货/售出
       自动累计欠款（现结售给已挂账单位同样计挂账）；未挂账单位交易不计入欠款。
-      日期筛选只收窄 records——欠款余额是当前状态（现算），不受期间过滤影响。
+    - 退货（purchase_return/sale_return）按负金额计入：挂账单位退货冲减欠款
+      （T5 定案：红冲后退货进对账单与余额，欠款相应减少）。
+    - 日期筛选只收窄 records——欠款余额是当前状态（现算），不受期间过滤影响。
     """
     _validate_date_filters(from_date, to_date)
     name = (counterparty or "").strip()
@@ -371,10 +594,13 @@ def query_credit(
     sql = (
         "SELECT doc_date, counterparty, doc_type, amount, note FROM ("
         "  SELECT t.biz_date AS doc_date, cp.name AS counterparty,"
-        "         t.biz_type AS doc_type, t.qty * t.price AS amount,"
+        "         t.biz_type AS doc_type,"
+        "         CASE WHEN t.biz_type IN ('purchase_return', 'sale_return')"
+        "              THEN -t.qty * t.price ELSE t.qty * t.price END AS amount,"
         "         t.note AS note, 0 AS sort_group, t.id AS seq"
         "  FROM transactions t JOIN counterparties cp ON cp.id = t.counterparty_id"
-        "  WHERE cp.is_credit = 1 AND t.biz_type IN ('purchase', 'sale')"
+        "  WHERE cp.is_credit = 1"
+        "    AND t.biz_type IN ('purchase', 'sale', 'purchase_return', 'sale_return')"
         "  UNION ALL"
         "  SELECT p.pay_date AS doc_date, cp.name AS counterparty,"
         "         p.pay_type AS doc_type, p.amount AS amount,"
@@ -396,9 +622,9 @@ def query_credit(
 
     bal_sql = (
         "SELECT cp.name AS counterparty,"
-        " COALESCE((SELECT SUM(t.qty * t.price) FROM transactions t"
-        "           WHERE t.counterparty_id = cp.id"
-        "             AND t.biz_type IN ('purchase', 'sale')), 0)"
+        " COALESCE((SELECT SUM(CASE WHEN t.biz_type IN ('purchase_return', 'sale_return')"
+        "                          THEN -t.qty * t.price ELSE t.qty * t.price END)"
+        "           FROM transactions t WHERE t.counterparty_id = cp.id), 0)"
         " - COALESCE((SELECT SUM(p.amount) FROM payments p"
         "             WHERE p.counterparty_id = cp.id), 0) AS balance"
         " FROM counterparties cp WHERE cp.is_credit = 1"
@@ -413,6 +639,67 @@ def query_credit(
     ]
     balances.sort(key=lambda b: (-b["balance"], b["counterparty"]))
     return {"records": records, "balances": balances}
+
+
+def query_history(
+    conn: sqlite3.Connection,
+    drawing_no: str | None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """单产品全部流水（spec D5：进货/售出/红冲逐笔），日期降序。
+
+    任意条件组合过滤（产品必填 + 日期区间）；列 = 日期/类型/图号/名称/数量+单位/
+    单价/金额/运费/成本/往来单位/备注/关联原单；退货行（purchase_return/sale_return）
+    带「红冲」关联原单标记（ref = 原单 id/日期/类型，普通行 ref 为 None）。
+    """
+    drawing_no = _require_drawing_no(drawing_no)
+    _validate_date_filters(from_date, to_date)
+    sql = (
+        "SELECT t.id, t.biz_date, t.biz_type, t.qty, t.price, t.freight, t.cost,"
+        "       t.note, t.ref_id,"
+        "       p.drawing_no, p.name, p.unit, cp.name AS counterparty,"
+        "       r.biz_date AS ref_biz_date, r.biz_type AS ref_biz_type"
+        " FROM transactions t"
+        " JOIN products p ON p.id = t.product_id"
+        " LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
+        " LEFT JOIN transactions r ON r.id = t.ref_id"
+        " WHERE p.drawing_no = ? COLLATE NOCASE"
+    )
+    params: list[Any] = [drawing_no]
+    if from_date is not None:
+        sql += " AND t.biz_date >= ?"
+        params.append(from_date.strip())
+    if to_date is not None:
+        sql += " AND t.biz_date <= ?"
+        params.append(to_date.strip())
+    sql += " ORDER BY t.biz_date DESC, t.id DESC"
+    rows = []
+    for r in conn.execute(sql, params).fetchall():
+        rows.append(
+            {
+                "id": r["id"],
+                "biz_date": r["biz_date"],
+                "biz_type": r["biz_type"],
+                "drawing_no": r["drawing_no"],
+                "name": r["name"],
+                "unit": r["unit"],
+                "qty": round(r["qty"], ROUND),
+                "price": r["price"],
+                "amount": round(r["qty"] * r["price"], ROUND),
+                "freight": round(r["freight"] or 0.0, ROUND),
+                "cost": round(r["cost"], ROUND) if r["cost"] is not None else None,
+                "counterparty": r["counterparty"],
+                "note": r["note"],
+                "ref_id": r["ref_id"],
+                "ref": (
+                    {"id": r["ref_id"], "biz_date": r["ref_biz_date"],
+                     "biz_type": r["ref_biz_type"]}
+                    if r["ref_id"] is not None else None
+                ),
+            }
+        )
+    return rows
 
 
 def record_opening(
