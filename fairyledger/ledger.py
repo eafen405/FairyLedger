@@ -1,12 +1,15 @@
-"""流水与库存成本：进货/售出/期初录入写入、当前库存与移动加权均价现算（spec D2 + ADR 0004）。
+"""流水、库存成本与挂账对账：进货/售出/期初录入/收付款写入、当前库存与移动加权均价、
+挂账欠款现算（spec D2/D6 + ADR 0001/0004）。
 
-- 写入命令（purchase/sale/opening）单事务原子：商品查证、往来单位解析、流水落库一体，
-  中途失败不留半截数据。
+- 写入命令（purchase/sale/opening/receive/pay）单事务原子：商品查证、往来单位解析、
+  流水落库一体，中途失败不留半截数据。
 - 派生值一律现算（ADR 0001）：当前数量 = 期初合计 + 流水净量，当前加权均价 =
-  结存金额 ÷ 结存数量，均不落列。
+  结存金额 ÷ 结存数量，往来欠款 = 挂账交易累计 − 收付款累计，均不落列。
 - 加权平均公式：单位成本 =（进货前结存金额 + 本次进货金额）÷（进货前结存数量 +
   本次进货数量）；只有进货触发重算，售出按当时均价快照成本出库、本身不改变均价；
   期初为首笔结存基数、无期初退化为本次进货单价；运费不进分子分母（T7 费用化）。
+- 挂账判定 = 往来单位档案 is_credit 标记（查询时现算）：档案挂账后该单位进货/售出
+  自动累计欠款，收/付款按累计制一笔冲减总额（spec D6）。
 """
 
 import datetime
@@ -31,13 +34,18 @@ def _require_drawing_no(drawing_no: str | None) -> str:
     return drawing_no
 
 
+def _require_positive(value: float | None, arg: str, label: str) -> float:
+    """正数必填：缺失 → 参数缺失；非正 → 必须为正数（流水/收付款核心事实）。"""
+    if value is None:
+        raise BusinessError(f"参数缺失: --{arg}")
+    if value <= 0:
+        raise BusinessError(f"{label}必须为正数")
+    return value
+
+
 def _require_positive_qty(qty: float | None) -> float:
     """数量必填且为正数（spec D1：qty 正数，流水核心事实）。"""
-    if qty is None:
-        raise BusinessError("参数缺失: --qty")
-    if qty <= 0:
-        raise BusinessError("数量必须为正数")
-    return qty
+    return _require_positive(qty, "qty", "数量")
 
 
 def _require_product(
@@ -102,6 +110,21 @@ def _normalize_date(date: str | None) -> str:
     if not DATE_RE.match(biz_date):
         raise BusinessError("日期格式应为 YYYY-MM-DD")
     return biz_date
+
+
+def _require_counterparty(name: str | None) -> str:
+    """往来单位必填：去空白，缺失 → 业务错误（spec D5：receive/pay 均 --counterparty）。"""
+    name = (name or "").strip()
+    if not name:
+        raise BusinessError("参数缺失: --counterparty")
+    return name
+
+
+def _validate_date_filters(from_date: str | None, to_date: str | None) -> None:
+    """查询日期筛选校验（可空；非空必须 YYYY-MM-DD，防脏数据破坏区间比较）。"""
+    for d in (from_date, to_date):
+        if d is not None and not DATE_RE.match(d.strip()):
+            raise BusinessError("日期格式应为 YYYY-MM-DD")
 
 
 def _tx_with_product(
@@ -230,6 +253,38 @@ def record_sale(
     )
 
 
+def record_payment(
+    conn: sqlite3.Connection,
+    pay_type: str,
+    counterparty: str | None,
+    amount: float | None,
+    date: str | None,
+    note: str | None,
+) -> dict[str, Any]:
+    """录一笔收款(receive)/付款(pay)流水（spec D5：累计制，一笔冲减欠款总额）。
+
+    往来单位必填、按名称 create-or-resolve（receive 打客户标记、pay 打供应商标记）；
+    金额必填为正数（方向在 pay_type）；日期缺省今天。挂账判定在查询侧（query credit）
+    由档案 is_credit 推导——写入侧不校验是否挂账单位，现结单位收付款照录、不进对账单。
+    """
+    counterparty = _require_counterparty(counterparty)
+    amount = _require_positive(amount, "amount", "金额")
+    pay_date = _normalize_date(date)
+    with conn:
+        cp_id = _resolve_counterparty(
+            conn, counterparty,
+            customer=(pay_type == "receive"), supplier=(pay_type == "pay"),
+        )
+        cur = conn.execute(
+            "INSERT INTO payments (pay_date, pay_type, counterparty_id, amount, note)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (pay_date, pay_type, cp_id, amount, note),
+        )
+        pay_id = cur.lastrowid
+    row = conn.execute("SELECT * FROM payments WHERE id = ?", (pay_id,)).fetchone()
+    return {**dict(row), "counterparty": counterparty}
+
+
 def query_price(
     conn: sqlite3.Connection,
     drawing_no: str | None,
@@ -243,9 +298,7 @@ def query_price(
     任意组合；日期降序第一条即上次成交价（spec D6）。
     """
     drawing_no = _require_drawing_no(drawing_no)
-    for d in (from_date, to_date):
-        if d is not None and not DATE_RE.match(d.strip()):
-            raise BusinessError("日期格式应为 YYYY-MM-DD")
+    _validate_date_filters(from_date, to_date)
     sql = (
         "SELECT t.id, t.biz_date, t.qty, t.price, t.cost, t.note,"
         " p.drawing_no, p.name, p.unit, cp.name AS customer"
@@ -284,6 +337,82 @@ def query_price(
             }
         )
     return rows
+
+
+def query_credit(
+    conn: sqlite3.Connection,
+    counterparty: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> dict[str, Any]:
+    """挂账对账单（spec D6）：一维表（挂账流水 + 收付款）+ 挂账单位欠款总览。
+
+    - records: 带挂账的记录按时间列出（日期/往来单位/单据/金额/备注），默认日期升序、
+      同日流水先于收付款、再按录入序；筛选 = 单位/日期任意组合。
+    - balances: 全部挂账单位期末欠款（= 挂账交易累计 − 收付款累计，全历史现算），
+      欠款降序；--counterparty 时只列该单位。
+    - 挂账判定 = 往来单位档案 is_credit 标记（查询时现算）：档案挂账后该单位进货/售出
+      自动累计欠款（现结售给已挂账单位同样计挂账）；未挂账单位交易不计入欠款。
+      日期筛选只收窄 records——欠款余额是当前状态（现算），不受期间过滤影响。
+    """
+    _validate_date_filters(from_date, to_date)
+    name = (counterparty or "").strip()
+
+    where, params = " WHERE 1 = 1", []
+    if name:
+        where += " AND counterparty = ? COLLATE NOCASE"
+        params.append(name)
+    if from_date is not None:
+        where += " AND doc_date >= ?"
+        params.append(from_date.strip())
+    if to_date is not None:
+        where += " AND doc_date <= ?"
+        params.append(to_date.strip())
+    sql = (
+        "SELECT doc_date, counterparty, doc_type, amount, note FROM ("
+        "  SELECT t.biz_date AS doc_date, cp.name AS counterparty,"
+        "         t.biz_type AS doc_type, t.qty * t.price AS amount,"
+        "         t.note AS note, 0 AS sort_group, t.id AS seq"
+        "  FROM transactions t JOIN counterparties cp ON cp.id = t.counterparty_id"
+        "  WHERE cp.is_credit = 1 AND t.biz_type IN ('purchase', 'sale')"
+        "  UNION ALL"
+        "  SELECT p.pay_date AS doc_date, cp.name AS counterparty,"
+        "         p.pay_type AS doc_type, p.amount AS amount,"
+        "         p.note AS note, 1 AS sort_group, p.id AS seq"
+        "  FROM payments p JOIN counterparties cp ON cp.id = p.counterparty_id"
+        "  WHERE cp.is_credit = 1"
+        f"){where} ORDER BY doc_date ASC, sort_group ASC, seq ASC"
+    )
+    records = [
+        {
+            "date": r["doc_date"],
+            "counterparty": r["counterparty"],
+            "doc_type": r["doc_type"],
+            "amount": round(r["amount"], ROUND),
+            "note": r["note"],
+        }
+        for r in conn.execute(sql, params).fetchall()
+    ]
+
+    bal_sql = (
+        "SELECT cp.name AS counterparty,"
+        " COALESCE((SELECT SUM(t.qty * t.price) FROM transactions t"
+        "           WHERE t.counterparty_id = cp.id"
+        "             AND t.biz_type IN ('purchase', 'sale')), 0)"
+        " - COALESCE((SELECT SUM(p.amount) FROM payments p"
+        "             WHERE p.counterparty_id = cp.id), 0) AS balance"
+        " FROM counterparties cp WHERE cp.is_credit = 1"
+    )
+    bal_params: list[Any] = []
+    if name:
+        bal_sql += " AND cp.name = ? COLLATE NOCASE"
+        bal_params.append(name)
+    balances = [
+        {"counterparty": r["counterparty"], "balance": round(r["balance"], ROUND)}
+        for r in conn.execute(bal_sql, bal_params).fetchall()
+    ]
+    balances.sort(key=lambda b: (-b["balance"], b["counterparty"]))
+    return {"records": records, "balances": balances}
 
 
 def record_opening(

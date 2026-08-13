@@ -60,6 +60,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_opening.add_argument("--qty", type=float, help="数量（必填，正数）")
     p_opening.add_argument("--cost", type=float, help="期初成本，缺省 0")
 
+    p_receive = sub.add_parser("receive", help="收款（收客户款，累计制一笔冲减挂账欠款）")
+    p_receive.add_argument("--counterparty", help="往来单位名称（必填）；不存在自动建档")
+    p_receive.add_argument("--amount", type=float, help="收款金额（必填，正数）")
+    p_receive.add_argument("--date", help="业务日期 YYYY-MM-DD，缺省今天")
+    p_receive.add_argument("--note", help="备注，可空")
+
+    p_pay = sub.add_parser("pay", help="付款（付供应商款，累计制一笔冲减挂账欠款）")
+    p_pay.add_argument("--counterparty", help="往来单位名称（必填）；不存在自动建档")
+    p_pay.add_argument("--amount", type=float, help="付款金额（必填，正数）")
+    p_pay.add_argument("--date", help="业务日期 YYYY-MM-DD，缺省今天")
+    p_pay.add_argument("--note", help="备注，可空")
+
     p_query = sub.add_parser("query", help="查询")
     p_query_sub = p_query.add_subparsers(dest="subcommand", metavar="<子命令>")
     p_stock = p_query_sub.add_parser("stock", help="当前库存")
@@ -69,6 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_price.add_argument("--customer", help="按客户过滤")
     p_price.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
     p_price.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
+    p_credit = p_query_sub.add_parser("credit", help="挂账对账单（一维表 + 单位欠款总览）")
+    p_credit.add_argument("--counterparty", help="按往来单位过滤")
+    p_credit.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
+    p_credit.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
     p_search = p_query_sub.add_parser("product", help="商品检索（歧义消解）")
     p_search.add_argument("--q", help="检索词：图号精确优先，否则词段 AND 匹配")
     return parser
@@ -123,11 +139,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             elif args.command == "opening":
                 _emit(ledger.record_opening(conn, args.drawing_no, args.qty, args.cost))
+            elif args.command == "receive":
+                _emit(ledger.record_payment(
+                    conn, "receive", args.counterparty, args.amount, args.date, args.note,
+                ))
+            elif args.command == "pay":
+                _emit(ledger.record_payment(
+                    conn, "pay", args.counterparty, args.amount, args.date, args.note,
+                ))
             elif args.command == "query" and args.subcommand == "stock":
                 _emit(ledger.query_stock(conn, args.drawing_no))
             elif args.command == "query" and args.subcommand == "price":
                 _emit(ledger.query_price(conn, args.drawing_no, args.customer,
                                          args.from_date, args.to_date))
+            elif args.command == "query" and args.subcommand == "credit":
+                _emit(ledger.query_credit(conn, args.counterparty,
+                                          args.from_date, args.to_date))
             elif args.command == "query" and args.subcommand == "product":
                 q = (args.q or "").strip()
                 if not q:

@@ -123,6 +123,21 @@ class T1Base(unittest.TestCase):
         self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
         return json.loads(cp.stdout)
 
+    def receive(self, *args: str) -> dict:
+        cp = self.fairy("receive", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def pay(self, *args: str) -> dict:
+        cp = self.fairy("pay", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def credit_rows(self, *args: str) -> dict:
+        cp = self.fairy("query", "credit", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
 
 class TestSchemaInit(T1Base):
     def test_empty_db_initializes_all_tables_and_indexes(self):
@@ -750,6 +765,214 @@ class TestQueryPrice(T1Base):
     def test_price_invalid_date_rejected(self):
         self._seed_sales()
         cp = self.fairy("query", "price", "--drawing-no", "170", "--from", "2026/08/01")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("日期格式", cp.stderr)
+
+
+class TestReceivePay(T1Base):
+    """T4 收款/付款：必填校验、create-or-resolve、默认值、落库（累计制一笔冲减）。"""
+
+    def test_counterparty_and_amount_required(self):
+        for args in (("--counterparty", "乙店"), ("--amount", "100")):
+            cp = self.fairy("receive", *args)
+            self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+            self.assertIn("参数缺失", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM payments")[0][0], 0,
+                         "参数缺失不应落任何收付款")
+
+    def test_basic_receive_writes_payment_and_marks_customer(self):
+        out = self.receive("--counterparty", "乙店", "--amount", "100")
+        self.assertEqual(out["pay_type"], "receive")
+        self.assertEqual(out["amount"], 100.0)
+        self.assertEqual(out["counterparty"], "乙店")
+        self.assertEqual(out["pay_date"], datetime.date.today().isoformat(), "日期缺省今天")
+        self.assertIsNone(out["note"])
+        self.assertIn("id", out)
+        self.assertEqual(self.query_db(
+            "SELECT name, is_customer, is_supplier, is_credit FROM counterparties"),
+            [("乙店", 1, 0, 0)], "新往来单位自动建档并打客户标记")
+
+    def test_pay_writes_payment_and_marks_supplier(self):
+        out = self.pay("--counterparty", "甲厂", "--amount", "50",
+                       "--date", "2026-08-01", "--note", "结货款")
+        self.assertEqual(out["pay_type"], "pay")
+        self.assertEqual(out["amount"], 50.0)
+        self.assertEqual(out["pay_date"], "2026-08-01")
+        self.assertEqual(out["note"], "结货款")
+        self.assertEqual(self.query_db(
+            "SELECT name, is_customer, is_supplier FROM counterparties"),
+            [("甲厂", 0, 1)], "付款打供应商标记")
+
+    def test_same_counterparty_reused(self):
+        self.receive("--counterparty", "乙店", "--amount", "10")
+        self.receive("--counterparty", "乙店", "--amount", "20")
+        self.assertEqual(len(self.query_db("SELECT id FROM counterparties")), 1,
+                         "同名往来单位复用，不重复建档")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM payments")[0][0], 2)
+
+    def test_negative_or_zero_amount_rejected(self):
+        for amt in ("-5", "0"):
+            cp = self.fairy("pay", "--counterparty", "甲厂", "--amount", amt)
+            self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM payments")[0][0], 0)
+
+    def test_invalid_date_rejected(self):
+        cp = self.fairy("receive", "--counterparty", "乙店", "--amount", "10",
+                        "--date", "2026/08/01")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("日期格式", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM payments")[0][0], 0)
+
+
+class TestQueryCredit(T1Base):
+    """T4 挂账对账单（spec D6）：欠款现算、一维表、总览、筛选。
+
+    挂账判定 = 往来单位档案 is_credit 标记（查询时现算）：档案挂账后该单位
+    交易自动累计欠款——现结售给已挂账单位同样计挂账（T4 口径）。
+    """
+
+    def _seed(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+        self.opening("--drawing-no", "170", "--qty", "100", "--cost", "4")
+
+    def test_empty_on_fresh_db(self):
+        out = self.credit_rows()
+        self.assertEqual(out, {"records": [], "balances": []})
+
+    def test_credit_sale_accumulates_debt(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        out = self.credit_rows()
+        self.assertEqual(len(out["records"]), 1)
+        rec = out["records"][0]
+        self.assertEqual(rec, {"date": "2026-08-01", "counterparty": "乙店",
+                               "doc_type": "sale", "amount": 30.0, "note": None},
+                         "对账单列 = 日期/往来单位/单据/金额/备注")
+        self.assertEqual(out["balances"], [{"counterparty": "乙店", "balance": 30.0}],
+                         "期末欠款 = 挂账交易累计 − 收付款累计")
+
+    def test_cash_sale_to_credit_flagged_unit_counts(self):
+        # 现结售给 is_credit=1 单位同样累计欠款（挂账由档案标记推导，不看单笔 --credit）
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "15",
+                  "--customer", "乙店", "--date", "2026-08-02")
+        out = self.credit_rows()
+        self.assertEqual(out["balances"], [{"counterparty": "乙店", "balance": 35.0}])
+        self.assertEqual(len(out["records"]), 2)
+
+    def test_non_credit_unit_excluded(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "10",
+                  "--customer", "丙店", "--date", "2026-08-01")  # 现结不挂账
+        self.receive("--counterparty", "丙店", "--amount", "5")  # 收款照录但单位未挂账
+        out = self.credit_rows()
+        self.assertEqual(out, {"records": [], "balances": []}, "未挂账单位交易不计入欠款")
+
+    def test_receive_reduces_balance(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        self.receive("--counterparty", "乙店", "--amount", "10", "--date", "2026-08-05")
+        out = self.credit_rows()
+        self.assertEqual(out["balances"], [{"counterparty": "乙店", "balance": 20.0}],
+                         "收款一笔冲减总额，余额现算")
+        self.assertEqual([r["doc_type"] for r in out["records"]], ["sale", "receive"],
+                         "挂账流水 + 收付款同列一维表")
+
+    def test_balance_recomputed_live_from_facts(self):
+        # 收款发生在挂账标记之前：查询时按当前档案标记现算（ADR 0001，状态由事实推导）
+        self._seed()
+        self.receive("--counterparty", "乙店", "--amount", "20", "--date", "2026-08-01")
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-05")
+        out = self.credit_rows()
+        self.assertEqual(out["balances"], [{"counterparty": "乙店", "balance": 10.0}])
+
+    def test_purchase_to_credit_unit_and_pay_reduce(self):
+        # 同一往来单位兼客户/供应商：进货也累计欠款，付款一笔冲减
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        self.purchase("--drawing-no", "170", "--qty", "2", "--price", "20",
+                      "--supplier", "乙店", "--date", "2026-08-02")
+        self.pay("--counterparty", "乙店", "--amount", "15", "--date", "2026-08-03")
+        out = self.credit_rows()
+        self.assertEqual(out["balances"], [{"counterparty": "乙店", "balance": 35.0}])
+        self.assertEqual([(r["date"], r["doc_type"], r["amount"]) for r in out["records"]],
+                         [("2026-08-01", "sale", 10.0),
+                          ("2026-08-02", "purchase", 40.0),
+                          ("2026-08-03", "pay", 15.0)], "默认日期升序")
+
+    def test_same_date_order_tx_before_payment(self):
+        # 同日：流水先于收付款、再按录入序（确定性排序）
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        self.receive("--counterparty", "乙店", "--amount", "10", "--date", "2026-08-01")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "20",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-02")
+        out = self.credit_rows()
+        self.assertEqual([(r["date"], r["doc_type"]) for r in out["records"]],
+                         [("2026-08-01", "sale"), ("2026-08-01", "receive"),
+                          ("2026-08-02", "sale")])
+
+    def test_filter_by_counterparty(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "50",
+                  "--customer", "丙店", "--credit", "--date", "2026-08-02")
+        out = self.credit_rows("--counterparty", "丙店")
+        self.assertEqual([r["counterparty"] for r in out["records"]], ["丙店"])
+        self.assertEqual(out["balances"], [{"counterparty": "丙店", "balance": 50.0}],
+                         "按单位筛选后总览只列该单位")
+
+    def test_filter_by_date_range_narrows_records_only(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        self.receive("--counterparty", "乙店", "--amount", "6", "--date", "2026-08-05")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "20",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-10")
+        out = self.credit_rows("--from", "2026-08-05", "--to", "2026-08-05")
+        self.assertEqual([(r["date"], r["doc_type"]) for r in out["records"]],
+                         [("2026-08-05", "receive")], "期间过滤收窄一维表（含边界）")
+        self.assertEqual(out["balances"], [{"counterparty": "乙店", "balance": 24.0}],
+                         "期末欠款是当前状态现算，不受期间过滤影响")
+
+    def test_balances_overview_sorted_desc_with_zero_and_non_credit_excluded(self):
+        self._seed()
+        self.add_product("--drawing-no", "171", "--name", "活塞环")
+        self.opening("--drawing-no", "171", "--qty", "50", "--cost", "4")
+        self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        self.sale("--drawing-no", "171", "--qty", "1", "--price", "60",
+                  "--customer", "丁店", "--credit", "--date", "2026-08-02")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "10",
+                  "--customer", "戊店", "--credit", "--date", "2026-08-03")  # 挂账但无后续
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "10",
+                  "--customer", "己店", "--date", "2026-08-04")  # 现结，非挂账
+        out = self.credit_rows()
+        self.assertEqual([(b["counterparty"], b["balance"]) for b in out["balances"]],
+                         [("丁店", 60.0), ("乙店", 20.0), ("戊店", 10.0)], "欠款降序")
+        self.assertNotIn("己店", [b["counterparty"] for b in out["balances"]],
+                         "未挂账单位不进总览")
+
+    def test_credit_unit_with_zero_balance_in_overview(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        self.receive("--counterparty", "乙店", "--amount", "10", "--date", "2026-08-02")
+        out = self.credit_rows()
+        self.assertEqual(out["balances"], [{"counterparty": "乙店", "balance": 0.0}],
+                         "挂账单位欠款清零后仍在总览（余额 0）")
+
+    def test_invalid_date_rejected(self):
+        self._seed()
+        cp = self.fairy("query", "credit", "--from", "2026/08/01")
         self.assertEqual(cp.returncode, 1)
         self.assertIn("日期格式", cp.stderr)
 
