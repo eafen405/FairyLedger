@@ -503,6 +503,30 @@ class TestOpening(T1Base):
         self.assertEqual(cp.returncode, 1)
         self.assertEqual(self.query_db("SELECT COUNT(*) FROM opening_stock")[0][0], 0)
 
+    def test_opening_writes_insert_audit(self):
+        # spec D1 + ADR 0003：归零补录与启用型期初同为 opening_stock 行，INSERT 必须留痕
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        out = self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        rows = self.audit_rows()
+        self.assertEqual(len(rows), 1, "期初录入恰好写一行审计")
+        _, table, record_id, action, before, after, _ = rows[0]
+        self.assertEqual(table, "opening_stock")
+        self.assertEqual(record_id, out["id"])
+        self.assertEqual(action, "insert")
+        self.assertIsNone(before, "insert 无前值")
+        after_d = json.loads(after)
+        self.assertEqual(after_d["id"], out["id"])
+        self.assertEqual(after_d["qty"], 10.0)
+        self.assertEqual(after_d["cost"], 4.0)
+
+    def test_opening_failure_writes_no_audit(self):
+        # 原子性：失败路径（无此商品）不写审计，也不留期初行
+        cp = self.fairy("opening", "--drawing-no", "NOPE", "--qty", "5")
+        self.assertEqual(cp.returncode, 1)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM opening_stock")[0][0], 0)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0,
+                         "失败不应写审计")
+
 
 class TestStockCost(T1Base):
     """T2 库存报表：数量/当前加权均价/金额全现算，默认图号序。"""
@@ -578,6 +602,34 @@ class TestStockCost(T1Base):
         self.assertEqual(rows[0]["qty"], 2.0)
         self.assertEqual(rows[0]["unit_cost"], 5.0)
         self.assertEqual(rows[0]["amount"], 10.0)
+
+
+class TestStockSortByQty(T1Base):
+    """D6 库存报表 --sort-by-qty：按数量降序，同数量图号升序，可与 --drawing-no 组合。"""
+
+    def _seed_three(self):
+        for dn, name in [("170", "活塞"), ("300.14.14", "缸盖"), ("221", "连杆")]:
+            self.add_product("--drawing-no", dn, "--name", name)
+        self.opening("--drawing-no", "300.14.14", "--qty", "5", "--cost", "2")
+        self.opening("--drawing-no", "170", "--qty", "2", "--cost", "4")
+        self.opening("--drawing-no", "221", "--qty", "2", "--cost", "3")
+
+    def test_sort_by_qty_desc_then_drawing_no_asc(self):
+        self._seed_three()
+        cp = self.fairy("query", "stock", "--sort-by-qty")
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        rows = json.loads(cp.stdout)
+        self.assertEqual([r["drawing_no"] for r in rows],
+                         ["300.14.14", "170", "221"], "按 qty 降序，同数量图号升序")
+        self.assertEqual([r["qty"] for r in rows], [5.0, 2.0, 2.0])
+
+    def test_sort_by_qty_combines_with_drawing_no_filter(self):
+        self._seed_three()
+        cp = self.fairy("query", "stock", "--drawing-no", "170", "--sort-by-qty")
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        rows = json.loads(cp.stdout)
+        self.assertEqual([r["drawing_no"] for r in rows], ["170"], "过滤仍生效")
+        self.assertEqual(rows[0]["qty"], 2.0)
 
 
 class TestSale(T1Base):
@@ -1173,8 +1225,8 @@ class TestReverse(T1Base):
         self.assertIn("已红冲", cp.stderr)
         self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 2,
                          "失败不新增第二次退货流水")
-        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 1,
-                         "失败不新增审计")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 2,
+                         "期初 insert 审计 1 条 + 首次红冲 1 条；失败不新增")
         row = self.stock_row("170")
         self.assertEqual(row["qty"], 10.0, "货只回库一次")
 
@@ -1191,8 +1243,8 @@ class TestReverse(T1Base):
         self._seed_stock()
         s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
         out = self.reverse("--tx", str(s["id"]))
-        rows = self.audit_rows()
-        self.assertEqual(len(rows), 1)
+        rows = [r for r in self.audit_rows() if r[3] == "reverse"]
+        self.assertEqual(len(rows), 1, "期初录入另写 insert 审计，此处只挑 reverse 行")
         audit_id, table, record_id, action, before, after, note = rows[0]
         self.assertEqual((table, record_id, action), ("transactions", s["id"], "reverse"))
         self.assertIn("reverse", note)
@@ -1222,14 +1274,16 @@ class TestEdit(T1Base):
         cp = self.fairy("edit", "--qty", "2")
         self.assertEqual(cp.returncode, 1)
         self.assertIn("参数缺失", cp.stderr)
-        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 1,
+                         "期初 insert 审计 1 条；缺参 edit 不新增")
 
     def test_edit_unknown_tx_exit1_atomic(self):
         self._seed_stock()
         cp = self.fairy("edit", "--tx", "999", "--qty", "2")
         self.assertEqual(cp.returncode, 1)
         self.assertIn("无此流水", cp.stderr)
-        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 1,
+                         "期初 insert 审计 1 条；edit 失败不新增")
 
     def test_edit_no_fields_exit1(self):
         self._seed_stock()
@@ -1237,8 +1291,8 @@ class TestEdit(T1Base):
         cp = self.fairy("edit", "--tx", str(s["id"]))
         self.assertEqual(cp.returncode, 1)
         self.assertIn("参数缺失", cp.stderr)
-        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0,
-                         "空修改不应写审计")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 1,
+                         "期初 insert 审计 1 条；空修改不应写审计")
 
     def test_edit_partial_update_qty_price_keeps_cost(self):
         self._seed_stock()
@@ -1313,15 +1367,16 @@ class TestEdit(T1Base):
         self.assertEqual(self.query_db(
             "SELECT qty FROM transactions WHERE id = ?", s["id"])[0][0], 3.0,
             "失败不改动原行")
-        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0,
-                         "校验失败不写审计")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 1,
+                         "期初 insert 审计 1 条；校验失败不写审计")
 
     def test_edit_negative_price_rejected(self):
         self._seed_stock()
         s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
         cp = self.fairy("edit", "--tx", str(s["id"]), "--price", "-5")
         self.assertEqual(cp.returncode, 1)
-        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 1,
+                         "期初 insert 审计 1 条；失败不写审计")
 
     def test_edit_rejects_drawing_no_flag(self):
         self._seed_stock()
@@ -1339,7 +1394,8 @@ class TestEdit(T1Base):
         cp = self.fairy("edit", "--tx", str(s["id"]), "--customer", "乙店")
         self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
         self.assertIn("无实际修改", cp.stderr)
-        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 1,
+                         "期初 insert 审计 1 条；无实际修改不写审计")
         cp_id = self.query_db("SELECT id FROM counterparties WHERE name = '乙店'")[0][0]
         self.assertEqual(self.query_db(
             "SELECT counterparty_id FROM transactions WHERE id = ?", s["id"])[0][0],
@@ -1352,7 +1408,8 @@ class TestEdit(T1Base):
         cp = self.fairy("edit", "--tx", str(s["id"]), "--qty", "3")
         self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
         self.assertIn("无实际修改", cp.stderr)
-        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 0)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM audit_log")[0][0], 1,
+                         "期初 insert 审计 1 条；无实际修改不写审计")
 
 
     def test_edit_writes_audit_before_after(self):
@@ -1360,8 +1417,8 @@ class TestEdit(T1Base):
         s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
                       "--note", "原备注")
         out = self.edit("--tx", str(s["id"]), "--qty", "2", "--note", "改后")
-        rows = self.audit_rows()
-        self.assertEqual(len(rows), 1)
+        rows = [r for r in self.audit_rows() if r[3] == "update"]
+        self.assertEqual(len(rows), 1, "期初录入另写 insert 审计，此处只挑 update 行")
         audit_id, table, record_id, action, before, after, note = rows[0]
         self.assertEqual((table, record_id, action), ("transactions", s["id"], "update"))
         self.assertIn("edit", note)
@@ -2251,6 +2308,113 @@ class TestReportPeriod(T1Base):
                        "--from", "2026/08/01", "--to", "2026-08-31", cwd=self._tmp.name)
         self.assertEqual(cp.returncode, 1)
         self.assertIn("日期格式", cp.stderr)
+
+
+class TestQueryOutFile(T1Base):
+    """D5 查询类文件产出（spec 第 296 行）：带 --out 时查询结果同时落 xlsx。
+
+    stdout 仍是纯查询结果 JSON（不包文件信息）；--out 只是副作用写文件，
+    写失败（OSError/ImportError）归系统错误退出码 2 且不 emit 查询 JSON。
+    list 型查询 → 单 sheet「结果」；dict 型查询 → 每个值为 list 的 key 一个同名 sheet。
+    """
+
+    def test_stock_out_writes_xlsx_keeps_stdout_json(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.opening("--drawing-no", "170", "--qty", "5", "--cost", "4")
+        out_path = Path(self._tmp.name) / "stock.xlsx"
+        cp = self.fairy("query", "stock", "--out", str(out_path))
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        self.assertTrue(out_path.exists(), "--out 应落文件")
+        self.assertEqual(xlsx_sheetnames(out_path), ["结果"], "list 型查询单 sheet「结果」")
+        rows = xlsx_sheet(out_path, "结果")
+        self.assertEqual(rows[0], ["id", "drawing_no", "name", "unit", "qty",
+                                   "unit_cost", "amount"], "表头 = 首元素 keys 插入序")
+        self.assertEqual(rows[1][1:4], ["170", "活塞", "件"])
+        self.assertEqual(rows[1][4], 5.0)
+        # stdout 仍是纯查询结果 JSON，与不带 --out 同构
+        plain = json.loads(self.fairy("query", "stock").stdout)
+        self.assertEqual(json.loads(cp.stdout), plain)
+
+    def test_credit_out_writes_records_and_balances_sheets(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "10",
+                  "--customer", "乙店", "--credit", "--date", "2026-08-01")
+        out_path = Path(self._tmp.name) / "credit.xlsx"
+        cp = self.fairy("query", "credit", "--out", str(out_path))
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        self.assertEqual(xlsx_sheetnames(out_path), ["records", "balances"],
+                         "dict 型查询每个值为 list 的 key 一个同名 sheet")
+        rec = xlsx_sheet(out_path, "records")
+        self.assertEqual(rec[0], ["date", "counterparty", "doc_type", "amount", "note"])
+        self.assertEqual(rec[1][:4], ["2026-08-01", "乙店", "sale", 30.0])
+        bal = xlsx_sheet(out_path, "balances")
+        self.assertEqual(bal[0], ["counterparty", "balance"])
+        self.assertEqual(bal[1], ["乙店", 30.0])
+        # 标量 key 不落 sheet
+        self.assertEqual(json.loads(cp.stdout)["records"],
+                         json.loads(self.fairy("query", "credit").stdout)["records"])
+
+    def test_product_out_writes_products_sheet_even_when_none(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        out_path = Path(self._tmp.name) / "search.xlsx"
+        cp = self.fairy("query", "product", "--q", "不存在的商品", "--out", str(out_path))
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        out = json.loads(cp.stdout)
+        self.assertEqual(out["match"], "none")
+        self.assertEqual(xlsx_sheetnames(out_path), ["products"],
+                         "match:none 仍写空 products sheet（跳过 match 标量 key）")
+        self.assertEqual(xlsx_sheet(out_path, "products"), [])
+
+    def test_product_out_exact_match_aliases_joined(self):
+        # 检索命中时 products 行含 aliases 列表列：应拼 '、' 串写入，不崩（openpyxl 不能写 list 单元格）
+        self.add_product("--drawing-no", "170", "--name", "活塞",
+                         "--alias", "活塞A", "--alias", "活塞总成")
+        out_path = Path(self._tmp.name) / "search_hit.xlsx"
+        cp = self.fairy("query", "product", "--q", "170", "--out", str(out_path))
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        self.assertEqual(json.loads(cp.stdout)["match"], "exact")
+        self.assertEqual(xlsx_sheetnames(out_path), ["products"])
+        prod = xlsx_sheet(out_path, "products")
+        self.assertIn("drawing_no", prod[0], "表头 = products 行 keys（id 在前）")
+        self.assertEqual(prod[1][prod[0].index("drawing_no")], "170")
+        self.assertEqual(prod[1][prod[0].index("aliases")], "活塞A、活塞总成",
+                         "aliases 列表列拼 '、' 串")
+
+    def test_stock_out_creates_missing_parent_dirs(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        out_path = Path(self._tmp.name) / "no" / "such" / "dir" / "x.xlsx"
+        cp = self.fairy("query", "stock", "--out", str(out_path))
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        self.assertTrue(out_path.exists(), "父目录不存在时应自动创建")
+        self.assertEqual(xlsx_sheetnames(out_path), ["结果"])
+
+    def test_stock_out_error_exit2_no_stdout(self):
+        # --out 父路径被普通文件占住 → 写文件失败 = 系统错误 2，且不应已 emit 查询 JSON
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        blocker = Path(self._tmp.name) / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        cp = self.fairy("query", "stock", "--out", str(blocker / "x.xlsx"))
+        self.assertEqual(cp.returncode, 2)
+        self.assertIn("系统错误", cp.stderr)
+        self.assertEqual(cp.stdout, "", "写文件失败时不应 emit 查询 JSON")
+
+    def test_margin_out_writes_group_sheets(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                  "--date", "2026-08-05")
+        out_path = Path(self._tmp.name) / "margin.xlsx"
+        cp = self.fairy("query", "margin", "--from", "2026-08-01", "--to", "2026-08-31",
+                        "--out", str(out_path))
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        self.assertEqual(xlsx_sheetnames(out_path), ["by_product", "by_customer"],
+                         "标量 key（from/to/amount/cost/margin/margin_rate）不落 sheet")
+        prod = xlsx_sheet(out_path, "by_product")
+        self.assertEqual(prod[0], ["drawing_no", "name", "amount", "cost", "margin",
+                                   "margin_rate"])
+        self.assertEqual(prod[1][0], "170")
+        self.assertEqual(json.loads(cp.stdout)["amount"], 45.0, "stdout 仍是纯查询 JSON")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@
 - 备份 = 复制库文件到库同目录 backups/，保留最近 7 份轮转（ledger-YYYYMMDD.db，
   同日同名覆盖天然幂等，超出删除最旧）。
 - 文件产出命令天然可重跑（幂等），无事务原子性要求。
+- 查询类 --out（spec D5）：查询结果同时落 xlsx（list 单 sheet「结果」、dict 每个
+  list 值一个同名 sheet），CLI 只作副作用不 emit 文件信息。
 """
 
 import datetime
@@ -174,6 +176,41 @@ def write_period_xlsx(data: dict, out_path: Path) -> dict:
                     "往来单位", "红冲原单"],
          [_detail_row(r) for r in data["details"]]),
     ]
+    return _write_workbook(sheets, out_path)
+
+
+def _query_cell(v: Any) -> Any:
+    """查询落表单元格值：list/tuple（如检索结果的别名数组）拼 '、' 串，其余原样
+    （None 由 _write_sheet 置空串；与 export 商品 sheet 别名列口径一致）。"""
+    if isinstance(v, (list, tuple)):
+        return "、".join(str(x) for x in v)
+    return v
+
+
+def write_query_xlsx(payload: Any, out_path: Path) -> dict:
+    """查询结果落 Excel（spec D5：查询类 --out 可选文件产出，side-effect 不 emit）。
+
+    list（query stock/price/history）→ 单 sheet「结果」：表头 = 首元素 keys
+    （插入序），每行 = 各 dict 的 values 按同序；空列表无表头只留空 sheet。
+    dict（query credit/product/margin）→ 每个「值为 list」的 key 一个同名 sheet
+    （records/balances/products/by_product/by_customer），跳过标量 key
+    （match/from/to/amount/cost/margin/margin_rate）；match:none 时 products 为
+    空列表仍写空 sheet。list 型单元格值（如检索结果 aliases 数组）拼 '、' 串。
+    返回值形状对齐 _write_workbook，调用方 CLI 不 emit。
+    """
+    if isinstance(payload, dict):
+        sheets = []
+        for name, rows in payload.items():
+            if not isinstance(rows, list):
+                continue
+            headers = list(rows[0].keys()) if rows else []
+            data = [[_query_cell(r[k]) for k in headers] for r in rows]
+            sheets.append((name, headers, data))
+    else:
+        rows = list(payload) if payload else []
+        headers = list(rows[0].keys()) if rows else []
+        data = [[_query_cell(r[k]) for k in headers] for r in rows]
+        sheets = [("结果", headers, data)]
     return _write_workbook(sheets, out_path)
 
 

@@ -107,7 +107,7 @@ SQLite 单文件库，7 张表。`products`、`aliases`、`counterparties`、`tr
 - **流水**：`cost` 为售出时成本快照；`freight` 进货/售出均可、默认 0；**不留 `amount` 物理列**，一律 `qty × price` 现算；`ref_id` 红冲关联原单。
 - **收付款**：累计制，一笔冲减总额，不逐笔关联 transactions，余额现算。
 - **期初库存**：常量基线，启用时录、之后不改；当前库存 = 期初合计 + 流水净量现算。
-- **审计日志**：行级快照，改/删前整行 + 后整行，可完整还原；永久保留，不设删除。
+- **审计日志**：行级快照，增/改/红冲各自留痕（改/红冲记前+后整行、增记后整行），可完整还原；永久保留，不设删除。
 
 ```sql
 -- 商品主数据
@@ -178,12 +178,12 @@ CREATE TABLE opening_stock (
     recorded_at TEXT DEFAULT (datetime('now','localtime'))
 );
 
--- 审计日志：行级快照，改/删前整行+后整行
+-- 审计日志：行级快照，增/改/红冲各自留痕（改/红冲记前+后整行、增记后整行）
 CREATE TABLE audit_log (
     id          INTEGER PRIMARY KEY,
     table_name  TEXT NOT NULL,
     record_id   INTEGER NOT NULL,
-    action      TEXT NOT NULL,   -- update/delete
+    action      TEXT NOT NULL,   -- insert/update/reverse
     before_json TEXT,
     after_json  TEXT,
     note        TEXT,

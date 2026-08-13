@@ -24,7 +24,7 @@ import datetime
 import json
 import re
 import sqlite3
-from typing import Any
+from typing import Any, NamedTuple
 
 from .errors import BusinessError
 
@@ -33,6 +33,34 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # 库存报表派生列：qty/unit_cost/amount 输出前四舍五入到 4 位小数，去掉浮点噪声
 ROUND = 4
+
+# 流水「退货负金额」SQL 片段：purchase_return/sale_return 按负金额计（挂账对账/日报共用口径）
+RETURN_AMOUNT_SQL = (
+    "CASE WHEN t.biz_type IN ('purchase_return', 'sale_return')"
+    " THEN -t.qty * t.price ELSE t.qty * t.price END"
+)
+
+# 明细流水查询共用 FROM/JOIN（含红冲原单自连接，统一 ref 别名 o）
+TX_DETAIL_FROM = (
+    " FROM transactions t"
+    " JOIN products p ON p.id = t.product_id"
+    " LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
+    " LEFT JOIN transactions o ON o.id = t.ref_id"
+)
+# 明细流水基础 SELECT 列（含红冲原单子对象所需 ref_id/ref_biz_date/ref_biz_type）
+TX_DETAIL_BASE_COLS = (
+    "t.id, t.biz_date, t.biz_type, t.qty, t.price, t.ref_id,"
+    " p.drawing_no, p.name, p.unit, cp.name AS counterparty,"
+    " o.biz_date AS ref_biz_date, o.biz_type AS ref_biz_type"
+)
+
+
+class StockState(NamedTuple):
+    """某商品库存状态快照：(数量, 当前加权均价, 结存金额)，由 _stock_state 现算返回。"""
+
+    qty: float
+    avg: float
+    amount: float
 
 
 def _require_drawing_no(drawing_no: str | None) -> str:
@@ -175,10 +203,11 @@ def _write_audit(
     after: sqlite3.Row | dict | None,
     note: str | None = None,
 ) -> int:
-    """写一行审计日志（spec D1）：改/删前整行 + 后整行 JSON 快照，可完整还原。
+    """写一行审计日志（spec D1）：改/红冲记前+后整行、增记后整行 JSON 快照，可完整还原。
 
     audit_log 无 CLI 暴露（spec Testing Decisions 允许测试只读核对）；
-    action 取值 update（edit）/ reverse（红冲），before/after 均为整行快照。
+    action 取值 insert（opening 期初）/ update（edit）/ reverse（红冲）；
+    insert 无前值，before 为 None、after 为插入后整行；update/reverse 记改/红冲前后整行。
     必须在调用方事务内执行，随业务写入同事务原子。
     """
     def _dump(row: sqlite3.Row | dict | None) -> str | None:
@@ -571,8 +600,7 @@ def _credit_balances(
     """
     bal_sql = (
         "SELECT cp.name AS counterparty,"
-        " COALESCE((SELECT SUM(CASE WHEN t.biz_type IN ('purchase_return', 'sale_return')"
-        "                          THEN -t.qty * t.price ELSE t.qty * t.price END)"
+        f" COALESCE((SELECT SUM({RETURN_AMOUNT_SQL})"
         "           FROM transactions t WHERE t.counterparty_id = cp.id), 0)"
         " - COALESCE((SELECT SUM(p.amount) FROM payments p"
         "             WHERE p.counterparty_id = cp.id), 0) AS balance"
@@ -625,8 +653,7 @@ def query_credit(
         "SELECT doc_date, counterparty, doc_type, amount, note FROM ("
         "  SELECT t.biz_date AS doc_date, cp.name AS counterparty,"
         "         t.biz_type AS doc_type,"
-        "         CASE WHEN t.biz_type IN ('purchase_return', 'sale_return')"
-        "              THEN -t.qty * t.price ELSE t.qty * t.price END AS amount,"
+        f"         {RETURN_AMOUNT_SQL} AS amount,"
         "         t.note AS note, 0 AS sort_group, t.id AS seq"
         "  FROM transactions t JOIN counterparties cp ON cp.id = t.counterparty_id"
         "  WHERE cp.is_credit = 1"
@@ -668,14 +695,7 @@ def query_history(
     drawing_no = _require_drawing_no(drawing_no)
     _validate_date_filters(from_date, to_date)
     sql = (
-        "SELECT t.id, t.biz_date, t.biz_type, t.qty, t.price, t.freight, t.cost,"
-        "       t.note, t.ref_id,"
-        "       p.drawing_no, p.name, p.unit, cp.name AS counterparty,"
-        "       r.biz_date AS ref_biz_date, r.biz_type AS ref_biz_type"
-        " FROM transactions t"
-        " JOIN products p ON p.id = t.product_id"
-        " LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
-        " LEFT JOIN transactions r ON r.id = t.ref_id"
+        f"SELECT {TX_DETAIL_BASE_COLS}, t.freight, t.cost, t.note{TX_DETAIL_FROM}"
         " WHERE p.drawing_no = ? COLLATE NOCASE"
     )
     params: list[Any] = [drawing_no]
@@ -711,7 +731,7 @@ def query_history(
 
 
 def _ref_dict(r: sqlite3.Row) -> dict[str, Any] | None:
-    """红冲原单子对象（须已 SELECT ref_id/ref_biz_date/ref_biz_date 列）；原单为空返回 None。
+    """红冲原单子对象（须已 SELECT ref_id/ref_biz_date/ref_biz_type 列）；原单为空返回 None。
 
     日报/周期汇总明细、export 流水、query history 共用同一形状（spec D6「红冲」标记）。
     """
@@ -776,7 +796,7 @@ def report_daily(
         (biz_date,),
     ).fetchall()
 
-    def _net(kind: str, ret_kind: str) -> tuple[int, float, float]:
+    def _net_amount_cost(kind: str, ret_kind: str) -> tuple[int, float, float]:
         count = 0
         amount = 0.0
         cost = 0.0
@@ -792,13 +812,12 @@ def report_daily(
             cost += sign * t["qty"] * (t["cost"] or 0.0)
         return count, amount, cost
 
-    p_count, p_amount, _ = _net("purchase", "purchase_return")
-    s_count, s_amount, s_cost = _net("sale", "sale_return")
+    p_count, p_amount, _ = _net_amount_cost("purchase", "purchase_return")
+    s_count, s_amount, s_cost = _net_amount_cost("sale", "sale_return")
     freight = round(sum((t["freight"] or 0.0) for t in tx_rows), ROUND)
 
     new_credit = conn.execute(
-        "SELECT COALESCE(SUM(CASE WHEN t.biz_type IN ('purchase_return', 'sale_return')"
-        "                        THEN -t.qty * t.price ELSE t.qty * t.price END), 0)"
+        f"SELECT COALESCE(SUM({RETURN_AMOUNT_SQL}), 0)"
         " FROM transactions t JOIN counterparties cp ON cp.id = t.counterparty_id"
         " WHERE cp.is_credit = 1 AND t.biz_date = ?"
         "   AND t.biz_type IN ('purchase', 'sale', 'purchase_return', 'sale_return')",
@@ -820,13 +839,7 @@ def report_daily(
 
     details = []
     for r in conn.execute(
-        "SELECT t.id, t.biz_date, t.biz_type, t.qty, t.price, t.ref_id,"
-        "       p.drawing_no, p.name, p.unit, cp.name AS counterparty,"
-        "       o.biz_date AS ref_biz_date, o.biz_type AS ref_biz_type"
-        " FROM transactions t"
-        " JOIN products p ON p.id = t.product_id"
-        " LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
-        " LEFT JOIN transactions o ON o.id = t.ref_id"
+        f"SELECT {TX_DETAIL_BASE_COLS}{TX_DETAIL_FROM}"
         " WHERE t.biz_date = ? AND t.biz_type IN"
         " ('purchase', 'sale', 'purchase_return', 'sale_return')"
         " ORDER BY t.id",
@@ -1036,7 +1049,7 @@ def record_opening(
     """录一笔期初库存（追加语义：同商品可多次，数量累加；成本缺省 0）。
 
     期初是库存与加权均价的起始基数；补录型（新商品出货归零）与启用型并存，
-    不区分、同为 opening_stock 行。
+    不区分、同为 opening_stock 行。每次 INSERT 写一行 insert 审计（spec D1）。
     """
     drawing_no = _require_drawing_no(drawing_no)
     qty = _require_positive_qty(qty)
@@ -1050,6 +1063,15 @@ def record_opening(
             (product["id"], qty, cost),
         )
         opening_id = cur.lastrowid
+        # 审计（spec D1）：归零补录与启用型期初同为 opening_stock 行，INSERT 留痕
+        # insert 无前值，before 为 None、after 为插入后整行；与 INSERT 同事务原子。
+        after = conn.execute(
+            "SELECT * FROM opening_stock WHERE id = ?", (opening_id,)
+        ).fetchone()
+        _write_audit(
+            conn, "opening_stock", opening_id, "insert", None, after,
+            f"opening_stock insert #{opening_id}",
+        )
     row = conn.execute(
         "SELECT * FROM opening_stock WHERE id = ?", (opening_id,)
     ).fetchone()
@@ -1067,7 +1089,7 @@ def _stock_state(
     *,
     before_date: str | None = None,
     until_date: str | None = None,
-) -> tuple[float, float, float]:
+) -> StockState:
     """重放期初 + 流水，现算某商品的 (数量, 当前加权均价, 结存金额)（ADR 0001/0004）。
 
     期初行按录入序聚合为基数（数量 Σqty、金额 Σqty×cost）；流水按
@@ -1075,8 +1097,8 @@ def _stock_state(
     before_date 时只推进 biz_date < before_date 的流水（周期汇总期初口径）、
     until_date 时只推进 biz_date <= until_date 的流水（周期汇总期末口径）；
     两者缺省 = 全历史（当前状态）。
-    售出/红冲分支（sale/purchase_return/sale_return）镜像 T1 数量 SQL 的符号方向，
-    待 T3/T5 开放对应写入命令后自然生效；当前均价 = 结存金额 ÷ 结存数量。
+    售出/红冲分支（sale/purchase_return/sale_return）镜像流水数量 SQL 的符号方向；
+    当前均价 = 结存金额 ÷ 结存数量。
     结存金额保持全精度，供金额列直接取用，避免 qty×avg 重算引入舍入差。
     """
     qty = 0.0
@@ -1115,16 +1137,19 @@ def _stock_state(
             amount += q * (cost or 0.0)  # 按原售出成本快照回库
             qty += q
     avg = amount / qty if qty else 0.0
-    return qty, avg, amount
+    return StockState(qty, avg, amount)
 
 
 def query_stock(
-    conn: sqlite3.Connection, drawing_no: str | None = None
+    conn: sqlite3.Connection,
+    drawing_no: str | None = None,
+    sort_by_qty: bool = False,
 ) -> list[dict[str, Any]]:
     """当前库存报表：图号/名称/数量+单位/当前加权均价/金额（全现算），默认图号序。
 
     列 = 图号/名称/数量+单位（期初+流水净量现算）/单位成本（当前加权均价）/
-    金额（qty×均价）；可 --drawing-no 过滤（spec D6）。
+    金额（qty×均价）；可 --drawing-no 过滤；--sort-by-qty 按数量降序、同数量
+    图号升序（spec D6）。
     """
     sql = "SELECT id, drawing_no, name, unit FROM products"
     params: list[Any] = []
@@ -1146,6 +1171,8 @@ def query_stock(
                 "amount": round(amount, ROUND),
             }
         )
+    if sort_by_qty:
+        rows.sort(key=lambda r: (-r["qty"], r["drawing_no"]))
     return rows
 
 
@@ -1160,14 +1187,7 @@ def export_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
     """
     flow = []
     for r in conn.execute(
-        "SELECT t.id, t.biz_date, t.biz_type, t.qty, t.price, t.freight, t.cost,"
-        "       t.note, t.ref_id, p.drawing_no, p.name, p.unit,"
-        "       cp.name AS counterparty,"
-        "       o.biz_date AS ref_biz_date, o.biz_type AS ref_biz_type"
-        " FROM transactions t"
-        " JOIN products p ON p.id = t.product_id"
-        " LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
-        " LEFT JOIN transactions o ON o.id = t.ref_id"
+        f"SELECT {TX_DETAIL_BASE_COLS}, t.freight, t.cost, t.note{TX_DETAIL_FROM}"
         " ORDER BY t.biz_date, t.id"
     ).fetchall():
         flow.append(
@@ -1261,7 +1281,7 @@ def period_report(
         (from_date, to_date),
     ).fetchall()
 
-    def _net(kind: str, ret_kind: str) -> tuple[int, float, float]:
+    def _net_amount_freight(kind: str, ret_kind: str) -> tuple[int, float, float]:
         count = 0
         amount = 0.0
         freight = 0.0
@@ -1277,8 +1297,8 @@ def period_report(
             amount += sign * t["qty"] * t["price"]
         return count, amount, freight
 
-    p_count, p_amount, p_freight = _net("purchase", "purchase_return")
-    s_count, s_amount, s_freight = _net("sale", "sale_return")
+    p_count, p_amount, p_freight = _net_amount_freight("purchase", "purchase_return")
+    s_count, s_amount, s_freight = _net_amount_freight("sale", "sale_return")
 
     cond = "t.biz_date BETWEEN ? AND ?"
     params: list[Any] = [from_date, to_date]
@@ -1289,18 +1309,12 @@ def period_report(
     opening_inventory = 0.0
     closing_inventory = 0.0
     for p in conn.execute("SELECT id FROM products").fetchall():
-        opening_inventory += _stock_state(conn, p["id"], before_date=from_date)[2]
-        closing_inventory += _stock_state(conn, p["id"], until_date=to_date)[2]
+        opening_inventory += _stock_state(conn, p["id"], before_date=from_date).amount
+        closing_inventory += _stock_state(conn, p["id"], until_date=to_date).amount
 
     details = []
     for r in conn.execute(
-        "SELECT t.id, t.biz_date, t.biz_type, t.qty, t.price, t.ref_id,"
-        "       p.drawing_no, p.name, p.unit, cp.name AS counterparty,"
-        "       o.biz_date AS ref_biz_date, o.biz_type AS ref_biz_type"
-        " FROM transactions t"
-        " JOIN products p ON p.id = t.product_id"
-        " LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
-        " LEFT JOIN transactions o ON o.id = t.ref_id"
+        f"SELECT {TX_DETAIL_BASE_COLS}{TX_DETAIL_FROM}"
         " WHERE t.biz_date BETWEEN ? AND ?"
         " AND t.biz_type IN ('purchase', 'sale', 'purchase_return', 'sale_return')"
         " ORDER BY t.biz_date, t.id",

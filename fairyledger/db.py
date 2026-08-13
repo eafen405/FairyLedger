@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY,
     table_name  TEXT NOT NULL,
     record_id   INTEGER NOT NULL,
-    action      TEXT NOT NULL,   -- update/delete
+    action      TEXT NOT NULL,   -- insert/update/reverse
     before_json TEXT,
     after_json  TEXT,
     note        TEXT,

@@ -90,26 +90,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_query_sub = p_query.add_subparsers(dest="subcommand", metavar="<子命令>")
     p_stock = p_query_sub.add_parser("stock", help="当前库存")
     p_stock.add_argument("--drawing-no", help="按图号过滤")
+    p_stock.add_argument("--sort-by-qty", action="store_true", help="按数量降序排序（缺省图号序）")
+    p_stock.add_argument("--out", help="输出表格文件路径；缺省不产文件")
     p_price = p_query_sub.add_parser("price", help="报价参考（历史成交价+成本快照）")
     p_price.add_argument("--drawing-no", help="图号（必填）")
     p_price.add_argument("--customer", help="按客户过滤")
     p_price.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
     p_price.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
+    p_price.add_argument("--out", help="输出表格文件路径；缺省不产文件")
     p_credit = p_query_sub.add_parser("credit", help="挂账对账单（一维表 + 单位欠款总览）")
     p_credit.add_argument("--counterparty", help="按往来单位过滤")
     p_credit.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
     p_credit.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
+    p_credit.add_argument("--out", help="输出表格文件路径；缺省不产文件")
     p_search = p_query_sub.add_parser("product", help="商品检索（歧义消解）")
     p_search.add_argument("--q", help="检索词：图号精确优先，否则词段 AND 匹配")
+    p_search.add_argument("--out", help="输出表格文件路径；缺省不产文件")
     p_history = p_query_sub.add_parser("history", help="单产品全部流水（进货/售出/红冲逐笔）")
     p_history.add_argument("--drawing-no", help="图号（必填）")
     p_history.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
     p_history.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
+    p_history.add_argument("--out", help="输出表格文件路径；缺省不产文件")
     p_margin = p_query_sub.add_parser("margin", help="期间毛利（默认本月，可过滤产品/客户）")
     p_margin.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
     p_margin.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
     p_margin.add_argument("--product", help="按图号过滤")
     p_margin.add_argument("--customer", help="按客户过滤")
+    p_margin.add_argument("--out", help="输出表格文件路径；缺省不产文件")
 
     p_report = sub.add_parser("report", help="报告")
     p_report_sub = p_report.add_subparsers(dest="subcommand", metavar="<子命令>")
@@ -196,24 +203,43 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.customer, args.date, args.note,
                 ))
             elif args.command == "query" and args.subcommand == "stock":
-                _emit(ledger.query_stock(conn, args.drawing_no))
+                result = ledger.query_stock(conn, args.drawing_no,
+                                            sort_by_qty=args.sort_by_qty)
+                if args.out:
+                    output.write_query_xlsx(result, Path(args.out).expanduser())
+                _emit(result)
             elif args.command == "query" and args.subcommand == "price":
-                _emit(ledger.query_price(conn, args.drawing_no, args.customer,
-                                         args.from_date, args.to_date))
+                result = ledger.query_price(conn, args.drawing_no, args.customer,
+                                            args.from_date, args.to_date)
+                if args.out:
+                    output.write_query_xlsx(result, Path(args.out).expanduser())
+                _emit(result)
             elif args.command == "query" and args.subcommand == "credit":
-                _emit(ledger.query_credit(conn, args.counterparty,
-                                          args.from_date, args.to_date))
+                result = ledger.query_credit(conn, args.counterparty,
+                                             args.from_date, args.to_date)
+                if args.out:
+                    output.write_query_xlsx(result, Path(args.out).expanduser())
+                _emit(result)
             elif args.command == "query" and args.subcommand == "history":
-                _emit(ledger.query_history(conn, args.drawing_no,
-                                           args.from_date, args.to_date))
+                result = ledger.query_history(conn, args.drawing_no,
+                                              args.from_date, args.to_date)
+                if args.out:
+                    output.write_query_xlsx(result, Path(args.out).expanduser())
+                _emit(result)
             elif args.command == "query" and args.subcommand == "product":
                 q = (args.q or "").strip()
                 if not q:
                     raise BusinessError("参数缺失: --q")
-                _emit(products.search_products(conn, q))
+                result = products.search_products(conn, q)
+                if args.out:
+                    output.write_query_xlsx(result, Path(args.out).expanduser())
+                _emit(result)
             elif args.command == "query" and args.subcommand == "margin":
-                _emit(ledger.query_margin(conn, args.from_date, args.to_date,
-                                          args.product, args.customer))
+                result = ledger.query_margin(conn, args.from_date, args.to_date,
+                                             args.product, args.customer)
+                if args.out:
+                    output.write_query_xlsx(result, Path(args.out).expanduser())
+                _emit(result)
             elif args.command == "report" and args.subcommand == "daily":
                 _emit(ledger.report_daily(conn, args.date))
             elif args.command == "report" and args.subcommand == "period":
