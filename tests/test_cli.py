@@ -14,6 +14,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import openpyxl
+
 ROOT = Path(__file__).resolve().parents[1]
 FAIRY = ROOT / "fairy"
 
@@ -28,11 +30,30 @@ TRANSACTION_COLUMNS = {
 }
 
 
-def run_fairy(db: Path, *args: str) -> subprocess.CompletedProcess:
+def run_fairy(db: Path, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(FAIRY), "--db", str(db), *args],
-        capture_output=True, text=True, encoding="utf-8",
+        capture_output=True, text=True, encoding="utf-8", cwd=str(cwd) if cwd else None,
     )
+
+
+def xlsx_sheetnames(path: Path) -> list[str]:
+    """只读打开产出 xlsx，返回 sheet 名列表（spec Testing Decisions 允许核对产出文件）。"""
+    wb = openpyxl.load_workbook(str(path), read_only=True)
+    try:
+        return wb.sheetnames
+    finally:
+        wb.close()
+
+
+def xlsx_sheet(path: Path, name: str) -> list[list]:
+    """只读打开产出 xlsx 的某 sheet，返回全部行（表头为第一行）。"""
+    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    try:
+        ws = wb[name]
+        return [[cell.value for cell in row] for row in ws.iter_rows()]
+    finally:
+        wb.close()
 
 
 def table_set(db: Path) -> set[str]:
@@ -1864,6 +1885,372 @@ class TestQueryMargin(T1Base):
                           "--customer", "没买过")
         self.assertEqual(out["amount"], 0.0)
         self.assertEqual(out["by_customer"], [])
+
+
+class TestExport(T1Base):
+    """T7 整库导出（spec D6）：Excel 单工作簿 5 Sheet（流水/商品/往来/库存/毛利），
+    默认文件名 FairyLedger_YYYYMMDD.xlsx（导出时点整库快照）；毛利 sheet =
+    按产品分组的全历史毛利汇总（口径已确认）；可 --out 指定路径；天然可重跑。"""
+
+    def _seed(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件",
+                         "--alias", "活塞总成")
+        self.add_product("--drawing-no", "171", "--name", "活塞环", "--unit", "副")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        self.opening("--drawing-no", "171", "--qty", "20", "--cost", "6")
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10",
+                      "--supplier", "甲厂", "--date", "2026-08-01", "--freight", "8",
+                      "--note", "首单")
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                  "--customer", "乙店", "--date", "2026-08-05")
+
+    def export(self, *args: str) -> dict:
+        cp = run_fairy(self.db, "export", *args, cwd=self._tmp.name)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def default_export(self) -> Path:
+        out = self.export()
+        path = Path(self._tmp.name) / f"FairyLedger_{datetime.date.today().strftime('%Y%m%d')}.xlsx"
+        self.assertEqual(out["file"], str(path))
+        return path
+
+    def test_export_default_filename_in_cwd_with_5_sheets(self):
+        self._seed()
+        out = self.export()
+        path = self.default_export()
+        self.assertEqual(out["file"], str(path), "默认文件名 FairyLedger_YYYYMMDD.xlsx")
+        self.assertEqual([s["name"] for s in out["sheets"]],
+                         ["流水", "商品", "往来单位", "库存", "毛利"], "Sheet 顺序对齐 spec D6")
+        self.assertTrue(path.exists())
+        self.assertEqual(xlsx_sheetnames(path), ["流水", "商品", "往来单位", "库存", "毛利"])
+
+    def test_export_flow_sheet_columns_and_ref_marker(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        s = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                      "--date", "2026-08-05")
+        self.reverse("--tx", str(s["id"]), "--date", "2026-08-06")
+        path = self.default_export()
+        rows = xlsx_sheet(path, "流水")
+        self.assertEqual(rows[0], ["日期", "类型", "图号", "名称", "数量+单位", "单价",
+                                   "金额", "运费", "成本", "往来单位", "红冲原单", "备注"])
+        by_type = {r[1]: r for r in rows[1:]}
+        self.assertEqual(set(by_type), {"售出", "售出退货"})
+        sale_row, ret_row = by_type["售出"], by_type["售出退货"]
+        self.assertEqual(sale_row[:5], ["2026-08-05", "售出", "170", "活塞", "3 件"])
+        self.assertEqual(sale_row[5], 15.0)
+        self.assertEqual(sale_row[6], 45.0, "金额 qty×price 现算")
+        self.assertEqual(sale_row[7], 0.0)
+        self.assertEqual(sale_row[8], 4.0, "售出行含成本快照")
+        self.assertEqual(ret_row[0], "2026-08-06")
+        self.assertEqual(ret_row[1], "售出退货")
+        self.assertEqual(ret_row[8], 4.0, "退货行按原单成本")
+        self.assertEqual(ret_row[10], f"#{s['id']} 2026-08-05 售出", "退货行带红冲原单标记")
+
+    def test_export_product_cp_stock_sheets(self):
+        self._seed()
+        path = self.default_export()
+        prod = xlsx_sheet(path, "商品")
+        self.assertEqual(prod[0], ["图号", "名称", "单位", "别名"])
+        by_dn = {r[0]: r for r in prod[1:]}
+        self.assertEqual(by_dn["170"], ["170", "活塞", "件", "活塞总成"])
+        self.assertEqual(by_dn["171"], ["171", "活塞环", "副", None], "无别名为空单元格")
+        cp = xlsx_sheet(path, "往来单位")
+        self.assertEqual(cp[0], ["名称", "类型标记", "挂账标记", "联系方式"])
+        by_name = {r[0]: r for r in cp[1:]}
+        self.assertEqual(by_name["甲厂"], ["甲厂", "供应商", "否", None], "联系方式空单元格")
+        self.assertEqual(by_name["乙店"], ["乙店", "客户", "否", None])
+        stock = xlsx_sheet(path, "库存")
+        self.assertEqual(stock[0], ["图号", "名称", "数量", "当前均价", "金额"])
+        stock_by_dn = {r[0]: r for r in stock[1:]}
+        self.assertEqual(stock_by_dn["170"], ["170", "活塞", 12.0, 6.0, 72.0],
+                         "库存现算：期初 10 + 进货 5 − 售出 3 = 12，(40+50)/15 = 6")
+        self.assertEqual(stock_by_dn["171"], ["171", "活塞环", 20.0, 6.0, 120.0])
+
+    def test_export_margin_sheet_full_history_by_product(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.add_product("--drawing-no", "171", "--name", "活塞环")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        self.opening("--drawing-no", "171", "--qty", "10", "--cost", "6")
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                  "--date", "2026-07-20")
+        self.sale("--drawing-no", "171", "--qty", "2", "--price", "30",
+                  "--date", "2026-08-05")
+        path = self.default_export()
+        rows = xlsx_sheet(path, "毛利")
+        self.assertEqual(rows[0], ["图号", "名称", "售出金额", "成本", "毛利", "毛利率"])
+        by_dn = {r[0]: r for r in rows[1:]}
+        self.assertEqual([r[0] for r in rows[1:]], ["171", "170"], "毛利降序")
+        self.assertEqual(by_dn["171"], ["171", "活塞环", 60.0, 12.0, 48.0, 0.8])
+        self.assertEqual(by_dn["170"], ["170", "活塞", 45.0, 12.0, 33.0,
+                                        round(33 / 45, 4)], "上月售出也计入（全历史）")
+
+    def test_export_dual_role_and_credit_marks(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "10",
+                  "--customer", "丙店", "--credit", "--date", "2026-08-01")
+        self.purchase("--drawing-no", "170", "--qty", "1", "--price", "5",
+                      "--supplier", "丙店", "--date", "2026-08-02")
+        path = self.default_export()
+        cp = xlsx_sheet(path, "往来单位")
+        by_name = {r[0]: r for r in cp[1:]}
+        self.assertEqual(by_name["丙店"], ["丙店", "客户+供应商", "是", None])
+
+    def test_export_out_custom_path_and_idempotent(self):
+        self._seed()
+        out_path = Path(self._tmp.name) / "custom" / "导出快照.xlsx"
+        cp = run_fairy(self.db, "export", "--out", str(out_path))
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        self.assertTrue(out_path.exists())
+        self.assertEqual(json.loads(cp.stdout)["file"], str(out_path.resolve()))
+        cp2 = run_fairy(self.db, "export", "--out", str(out_path))
+        self.assertEqual(cp2.returncode, 0, "文件产出命令天然可重跑（幂等）")
+        self.assertEqual(xlsx_sheetnames(out_path), ["流水", "商品", "往来单位", "库存", "毛利"])
+
+    def test_export_empty_db_still_produces_5_sheets(self):
+        # 不造任何数据：空库也应产出 5 个带表头的 sheet
+        path = self.default_export()
+        self.assertTrue(path.exists())
+        self.assertEqual(xlsx_sheetnames(path), ["流水", "商品", "往来单位", "库存", "毛利"])
+        for name in ("流水", "商品", "往来单位", "库存", "毛利"):
+            self.assertEqual(len(xlsx_sheet(path, name)), 1, f"{name} sheet 空库仅表头一行")
+
+
+class TestBackup(T1Base):
+    """T7 备份（spec D6）：复制库文件到库同目录 backups/ledger-YYYYMMDD.db，
+    保留最近 7 份轮转（超出删除最旧）；同日多次备份同名覆盖天然幂等。"""
+
+    def _seed(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.opening("--drawing-no", "170", "--qty", "5", "--cost", "4")
+
+    def backup(self, *args: str) -> dict:
+        cp = self.fairy("backup", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def backup_dir(self) -> Path:
+        return self.db.parent / "backups"
+
+    def test_backup_creates_backup_dir_and_todays_file(self):
+        self._seed()
+        out = self.backup()
+        today = datetime.date.today().strftime("%Y%m%d")
+        path = self.backup_dir() / f"ledger-{today}.db"
+        self.assertEqual(out["backup"], str(path), "备份到库同目录 backups/ 下")
+        self.assertTrue(path.exists())
+        self.assertEqual(out["retained"], [f"ledger-{today}.db"])
+        self.assertEqual(out["removed"], [])
+
+    def test_backup_is_copy_of_db(self):
+        self._seed()
+        out = self.backup()
+        conn = sqlite3.connect(out["backup"])
+        try:
+            rows = conn.execute("SELECT drawing_no, name FROM products").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(rows, [("170", "活塞")], "备份文件是库文件的可读副本")
+
+    def test_backup_same_day_overwrites_idempotent(self):
+        self._seed()
+        self.backup()
+        self.backup()
+        files = sorted(p.name for p in self.backup_dir().glob("ledger-*.db"))
+        self.assertEqual(len(files), 1, "同日多次备份同名覆盖，天然幂等")
+
+    def test_backup_rotates_keeps_7_removes_oldest(self):
+        self._seed()
+        d = self.backup_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        # 预置今天之前 7 天的历史备份（与今天的合计 8 份，超出 1 份）
+        for i in range(7):
+            day = (datetime.date.today() - datetime.timedelta(days=7 - i)).strftime("%Y%m%d")
+            (d / f"ledger-{day}.db").write_bytes(b"old")
+        out = self.backup()
+        files = sorted(p.name for p in d.glob("ledger-*.db"))
+        self.assertEqual(len(files), 7, "保留最近 7 份轮转")
+        oldest_day = (datetime.date.today() - datetime.timedelta(days=7)).strftime("%Y%m%d")
+        self.assertNotIn(f"ledger-{oldest_day}.db", files, "超出部分删除最旧")
+        self.assertEqual(out["removed"], [f"ledger-{oldest_day}.db"])
+        self.assertEqual(len(out["retained"]), 7)
+
+    def test_backup_keeps_newest_7_after_many_old(self):
+        self._seed()
+        d = self.backup_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(9):  # 9 个旧备份 + 今天 = 10 → 删最旧 3 个
+            day = (datetime.date.today() - datetime.timedelta(days=10 - i)).strftime("%Y%m%d")
+            (d / f"ledger-{day}.db").write_bytes(b"old")
+        self.backup()
+        files = sorted(p.name for p in d.glob("ledger-*.db"))
+        self.assertEqual(len(files), 7)
+
+
+class TestReportPeriod(T1Base):
+    """T7 周期汇总（spec D6）：周/月/年同一套结构、仅区间不同；Excel =
+    期间汇总（进货/售出笔数金额运费、毛利、期初期末库存金额）+ 按产品/客户 TOP 10
+    （毛利降序）+ 流水明细（同日报明细结构）；文件名带区间；期初 < from、期末 ≤ to
+    （口径已确认）。"""
+
+    def _seed(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+        self.add_product("--drawing-no", "171", "--name", "活塞环", "--unit", "副")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        self.opening("--drawing-no", "171", "--qty", "20", "--cost", "6")
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10",
+                      "--freight", "8", "--date", "2026-07-30")  # 期前
+        self.purchase("--drawing-no", "170", "--qty", "3", "--price", "10",
+                      "--freight", "2", "--date", "2026-08-05")  # 期内
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "15",
+                  "--date", "2026-08-06")
+        self.sale("--drawing-no", "171", "--qty", "2", "--price", "30",
+                  "--date", "2026-08-06")
+
+    def period(self, *args: str) -> dict:
+        cp = run_fairy(self.db, "report", "period", *args, cwd=self._tmp.name)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def period_path(self, from_date: str, to_date: str) -> Path:
+        return Path(self._tmp.name) / (
+            f"FairyLedger_周期汇总_{from_date.replace('-', '')}-{to_date.replace('-', '')}.xlsx"
+        )
+
+    def summary_map(self, from_date: str, to_date: str) -> dict:
+        rows = xlsx_sheet(self.period_path(from_date, to_date), "期间汇总")
+        self.assertEqual(rows[0], ["项目", "金额"])
+        return {r[0]: r[1] for r in rows[1:]}
+
+    def test_period_default_filename_and_4_sheets(self):
+        self._seed()
+        out = self.period("--from", "2026-08-01", "--to", "2026-08-31")
+        path = self.period_path("2026-08-01", "2026-08-31")
+        self.assertEqual(out["file"], str(path), "文件名带区间")
+        self.assertEqual([s["name"] for s in out["sheets"]],
+                         ["期间汇总", "按产品分组", "按客户分组", "流水明细"])
+        self.assertTrue(path.exists())
+        self.assertEqual(xlsx_sheetnames(path),
+                         ["期间汇总", "按产品分组", "按客户分组", "流水明细"])
+
+    def test_period_summary_numbers(self):
+        self._seed()
+        self.period("--from", "2026-08-01", "--to", "2026-08-31")
+        d = self.summary_map("2026-08-01", "2026-08-31")
+        self.assertEqual(d["进货笔数"], 1, "7/30 进货在期前不计入")
+        self.assertEqual(d["进货金额"], 30.0)
+        self.assertEqual(d["进货运费"], 2.0)
+        self.assertEqual(d["售出笔数"], 2)
+        self.assertEqual(d["售出金额"], 105.0)
+        self.assertEqual(d["售出运费"], 0.0)
+        self.assertEqual(d["毛利"], 73.0)
+        self.assertEqual(d["期初库存金额"], 210.0, "期初 = 期初录入 160 + 期前进货 50")
+        self.assertEqual(d["期末库存金额"], 208.0, "期末 = 期初 210 + 期内进货 30 − 售出成本 32")
+
+    def test_period_by_product_and_customer_groups(self):
+        self._seed()
+        self.period("--from", "2026-08-01", "--to", "2026-08-31")
+        path = self.period_path("2026-08-01", "2026-08-31")
+        prod = xlsx_sheet(path, "按产品分组")
+        self.assertEqual(prod[0], ["图号", "名称", "售出数量", "售出金额", "成本", "毛利", "毛利率"])
+        self.assertEqual([r[0] for r in prod[1:]], ["171", "170"], "毛利降序")
+        by_dn = {r[0]: r for r in prod[1:]}
+        self.assertEqual(by_dn["171"], ["171", "活塞环", 2, 60.0, 12.0, 48.0, 0.8])
+        self.assertEqual(by_dn["170"], ["170", "活塞", 3, 45.0, 20.0, 25.0,
+                                        round(25 / 45, 4)])
+        cust = xlsx_sheet(path, "按客户分组")
+        self.assertEqual(cust[0], ["客户", "售出金额", "毛利", "毛利率"])
+        self.assertEqual(len(cust[1:]), 1, "全部现结归入空客户组")
+        self.assertEqual(cust[1], [None, 105.0, 73.0, round(73 / 105, 4)])
+
+    def test_period_details_same_as_daily_with_ref_marker(self):
+        self._seed()
+        s = self.sale("--drawing-no", "170", "--qty", "1", "--price", "15",
+                      "--date", "2026-08-07")
+        self.reverse("--tx", str(s["id"]), "--date", "2026-08-08")
+        self.period("--from", "2026-08-01", "--to", "2026-08-31")
+        rows = xlsx_sheet(self.period_path("2026-08-01", "2026-08-31"), "流水明细")
+        self.assertEqual(rows[0], ["日期", "类型", "图号", "名称", "数量+单位", "单价",
+                                   "金额", "往来单位", "红冲原单"])
+        self.assertEqual([r[0] for r in rows[1:]],
+                         ["2026-08-05", "2026-08-06", "2026-08-06",
+                          "2026-08-07", "2026-08-08"], "期间逐笔按日期序")
+        last = rows[-1]
+        self.assertEqual(last[1], "售出退货")
+        self.assertEqual(last[4], "1 件")
+        self.assertEqual(last[8], f"#{s['id']} 2026-08-07 售出", "退货行带红冲原单标记")
+
+    def test_period_summary_nets_returns(self):
+        self._seed()
+        s = self.sale("--drawing-no", "170", "--qty", "2", "--price", "15",
+                      "--date", "2026-08-10")
+        self.reverse("--tx", str(s["id"]), "--date", "2026-08-12")
+        self.period("--from", "2026-08-01", "--to", "2026-08-31")
+        d = self.summary_map("2026-08-01", "2026-08-31")
+        self.assertEqual(d["售出笔数"], 2, "售出退货净额冲减笔数 (2+1−1)")
+        self.assertEqual(d["售出金额"], 105.0, "105 + 30 − 30")
+        self.assertEqual(d["毛利"], 73.0, "期内售出与退货毛利互抵")
+
+    def test_period_defaults_to_current_month(self):
+        today = datetime.date.today()
+        self.add_product("--drawing-no", "170", "--name", "活塞")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+        self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                  "--date", today.isoformat())
+        out = self.period()
+        expected_from = f"{today.year:04d}-{today.month:02d}-01"
+        self.assertEqual(out["file"],
+                         str(self.period_path(expected_from, today.isoformat())))
+        d = self.summary_map(expected_from, today.isoformat())
+        self.assertEqual(d["售出金额"], 20.0)
+
+    def test_period_top10_cap(self):
+        today = datetime.date.today()
+        for i in range(11):
+            dn = f"P{i:02d}"
+            self.add_product("--drawing-no", dn, "--name", f"件{i}")
+            self.opening("--drawing-no", dn, "--qty", "10", "--cost", "1")
+            self.sale("--drawing-no", dn, "--qty", "1", "--price", "20",
+                      "--date", today.isoformat())
+        self.period()
+        expected_from = f"{today.year:04d}-{today.month:02d}-01"
+        rows = xlsx_sheet(self.period_path(expected_from, today.isoformat()), "按产品分组")
+        self.assertEqual(len(rows) - 1, 10, "按产品 TOP 10 封顶")
+        margins = [r[5] for r in rows[1:]]
+        self.assertEqual(margins, sorted(margins, reverse=True), "毛利降序")
+
+    def test_period_out_custom_path(self):
+        self._seed()
+        out_path = Path(self._tmp.name) / "custom" / "月报.xlsx"
+        cp = run_fairy(self.db, "report", "period",
+                       "--from", "2026-08-01", "--to", "2026-08-31",
+                       "--out", str(out_path))
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        self.assertTrue(out_path.exists())
+        self.assertEqual(json.loads(cp.stdout)["file"], str(out_path.resolve()))
+
+    def test_period_half_open_range_rejected(self):
+        self._seed()
+        for args in (("--from", "2026-08-01"), ("--to", "2026-08-31")):
+            cp = run_fairy(self.db, "report", "period", *args, cwd=self._tmp.name)
+            self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+            self.assertIn("参数缺失", cp.stderr)
+
+    def test_period_from_after_to_rejected(self):
+        self._seed()
+        cp = run_fairy(self.db, "report", "period",
+                       "--from", "2026-08-31", "--to", "2026-08-01", cwd=self._tmp.name)
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("晚于", cp.stderr)
+
+    def test_period_invalid_date_rejected(self):
+        self._seed()
+        cp = run_fairy(self.db, "report", "period",
+                       "--from", "2026/08/01", "--to", "2026-08-31", cwd=self._tmp.name)
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("日期格式", cp.stderr)
 
 
 if __name__ == "__main__":

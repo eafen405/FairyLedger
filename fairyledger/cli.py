@@ -8,9 +8,10 @@ import argparse
 import json
 import sqlite3
 import sys
+from pathlib import Path
 from typing import Any, Sequence
 
-from . import db, ledger, products
+from . import db, ledger, output, products
 from .errors import BusinessError
 
 
@@ -116,6 +117,16 @@ def build_parser() -> argparse.ArgumentParser:
         "daily", help="日报（默认昨天，输出结构化 JSON 四块，Fairy 发文字消息，不产文件）"
     )
     p_daily.add_argument("--date", help="业务日期 YYYY-MM-DD，缺省昨天")
+    p_period = p_report_sub.add_parser(
+        "period", help="周期汇总（周/月/年同一套结构，出 Excel；缺省默认本月）"
+    )
+    p_period.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
+    p_period.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
+    p_period.add_argument("--out", help="输出路径，缺省当前目录 FairyLedger_周期汇总_区间.xlsx")
+
+    p_export = sub.add_parser("export", help="整库导出 Excel 单工作簿 5-Sheet")
+    p_export.add_argument("--out", help="输出路径，缺省当前目录 FairyLedger_YYYYMMDD.xlsx")
+    p_backup = sub.add_parser("backup", help="备份库文件到 backups/，保留最近 7 份轮转")
     return parser
 
 
@@ -142,7 +153,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     try:
-        conn = db.connect(db.resolve_db_path(args.db))
+        db_path = db.resolve_db_path(args.db)
+        conn = db.connect(db_path)
         try:
             db.ensure_schema(conn)
             if args.command == "product" and args.subcommand == "add":
@@ -204,6 +216,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                                           args.product, args.customer))
             elif args.command == "report" and args.subcommand == "daily":
                 _emit(ledger.report_daily(conn, args.date))
+            elif args.command == "report" and args.subcommand == "period":
+                data = ledger.period_report(conn, args.from_date, args.to_date)
+                out_path = (
+                    Path(args.out).expanduser()
+                    if args.out else output.default_period_path(data["from"], data["to"])
+                )
+                _emit(output.write_period_xlsx(data, out_path))
+            elif args.command == "export":
+                out_path = (
+                    Path(args.out).expanduser()
+                    if args.out else output.default_export_path()
+                )
+                _emit(output.write_export_xlsx(ledger.export_snapshot(conn), out_path))
+            elif args.command == "backup":
+                _emit(output.backup_db(db_path))
             else:
                 detail = getattr(args, "subcommand", None)
                 raise BusinessError(
@@ -215,7 +242,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except BusinessError as exc:
         print(f"fairy: error: {exc}", file=sys.stderr)
         return 1
-    except (sqlite3.Error, OSError) as exc:
+    except (sqlite3.Error, OSError, ImportError) as exc:
         print(f"fairy: error: 系统错误: {exc}", file=sys.stderr)
         return 2
 

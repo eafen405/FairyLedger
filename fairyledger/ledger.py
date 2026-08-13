@@ -704,14 +704,44 @@ def query_history(
                 "counterparty": r["counterparty"],
                 "note": r["note"],
                 "ref_id": r["ref_id"],
-                "ref": (
-                    {"id": r["ref_id"], "biz_date": r["ref_biz_date"],
-                     "biz_type": r["ref_biz_type"]}
-                    if r["ref_id"] is not None else None
-                ),
+                "ref": _ref_dict(r),
             }
         )
     return rows
+
+
+def _ref_dict(r: sqlite3.Row) -> dict[str, Any] | None:
+    """红冲原单子对象（须已 SELECT ref_id/ref_biz_date/ref_biz_date 列）；原单为空返回 None。
+
+    日报/周期汇总明细、export 流水、query history 共用同一形状（spec D6「红冲」标记）。
+    """
+    if r["ref_id"] is None:
+        return None
+    return {
+        "id": r["ref_id"],
+        "biz_date": r["ref_biz_date"],
+        "biz_type": r["ref_biz_type"],
+    }
+
+
+def _detail_dict(r: sqlite3.Row) -> dict[str, Any]:
+    """流水明细行（日报/周期汇总明细共用，spec D6 日报明细结构）。
+
+    列 = 日期/类型/图号/名称/数量+单位/单价/金额/往来单位 + 退货行「红冲」ref 原单标记。
+    """
+    return {
+        "id": r["id"],
+        "biz_date": r["biz_date"],
+        "biz_type": r["biz_type"],
+        "drawing_no": r["drawing_no"],
+        "name": r["name"],
+        "unit": r["unit"],
+        "qty": round(r["qty"], ROUND),
+        "price": r["price"],
+        "amount": round(r["qty"] * r["price"], ROUND),
+        "counterparty": r["counterparty"],
+        "ref": _ref_dict(r),
+    }
 
 
 def report_daily(
@@ -802,25 +832,7 @@ def report_daily(
         " ORDER BY t.id",
         (biz_date,),
     ).fetchall():
-        details.append(
-            {
-                "id": r["id"],
-                "biz_date": r["biz_date"],
-                "biz_type": r["biz_type"],
-                "drawing_no": r["drawing_no"],
-                "name": r["name"],
-                "unit": r["unit"],
-                "qty": round(r["qty"], ROUND),
-                "price": r["price"],
-                "amount": round(r["qty"] * r["price"], ROUND),
-                "counterparty": r["counterparty"],
-                "ref": (
-                    {"id": r["ref_id"], "biz_date": r["ref_biz_date"],
-                     "biz_type": r["ref_biz_type"]}
-                    if r["ref_id"] is not None else None
-                ),
-            }
-        )
+        details.append(_detail_dict(r))
 
     alerts = []
     for r in conn.execute(
@@ -872,6 +884,96 @@ def report_daily(
     }
 
 
+def _parse_period(from_date: str | None, to_date: str | None) -> tuple[str, str]:
+    """期间参数解析（query margin / report period 共用）：缺省默认本月；
+    --from/--to 须成对给出；YYYY-MM-DD 格式；起≤止。返回 (from, to)。"""
+    today = datetime.date.today()
+    if from_date is None and to_date is None:
+        return f"{today.year:04d}-{today.month:02d}-01", today.isoformat()
+    if from_date is None or to_date is None:
+        raise BusinessError("参数缺失: --from 与 --to 须成对给出（缺省默认本月）")
+    from_date, to_date = from_date.strip(), to_date.strip()
+    if not (DATE_RE.match(from_date) and DATE_RE.match(to_date)):
+        raise BusinessError("日期格式应为 YYYY-MM-DD")
+    if from_date > to_date:
+        raise BusinessError("起始日期不能晚于截止日期")
+    return from_date, to_date
+
+
+def _margin_grouped(
+    conn: sqlite3.Connection,
+    cond: str,
+    params: list[Any],
+    *,
+    with_qty: bool = False,
+) -> tuple[float, float, list[dict[str, Any]], list[dict[str, Any]]]:
+    """期间毛利核心（query margin / report period / export 毛利 sheet 共用，口径单一来源）。
+
+    cond/params 已含全部过滤条件（如 `t.biz_date BETWEEN ? AND ?`、产品/客户过滤）；
+    口径：sale 正、sale_return 负（售出退货按原单冲减当期）；毛利 = 金额 − 成本快照
+    合计；毛利率 = 毛利 ÷ 金额（无售出时 null）。返回 (售出净额, 成本净额,
+    按产品分组, 按客户分组)，分组均毛利降序。with_qty=True 时产品分组多
+    「售出数量」列（period 报表用），query margin 不带该列。
+    """
+    amount = 0.0
+    cost = 0.0
+    for t in conn.execute(
+        f"SELECT biz_type, qty, price, cost FROM transactions t"
+        f" WHERE t.biz_type IN ('sale', 'sale_return') AND {cond}",
+        params,
+    ).fetchall():
+        sign = -1 if t["biz_type"] == "sale_return" else 1
+        amount += sign * t["qty"] * t["price"]
+        cost += sign * t["qty"] * (t["cost"] or 0.0)
+
+    amount_sql = (
+        "SUM(CASE WHEN t.biz_type = 'sale' THEN t.qty * t.price"
+        "         ELSE -t.qty * t.price END)"
+    )
+    cost_sql = (
+        "SUM(CASE WHEN t.biz_type = 'sale' THEN t.qty * COALESCE(t.cost, 0)"
+        "         ELSE -t.qty * COALESCE(t.cost, 0) END)"
+    )
+    qty_sql = "SUM(CASE WHEN t.biz_type = 'sale' THEN t.qty ELSE -t.qty END)"
+
+    def _margin_rows(sql: str, params: list[Any]) -> list[dict[str, Any]]:
+        rows = []
+        for r in conn.execute(sql, params).fetchall():
+            g_amount = r["amount"]
+            g_cost = r["cost"]
+            g_margin = g_amount - g_cost
+            row = dict(r)
+            row.pop("amount", None)
+            row.pop("cost", None)
+            row["amount"] = round(g_amount, ROUND)
+            row["cost"] = round(g_cost, ROUND)
+            row["margin"] = round(g_margin, ROUND)
+            row["margin_rate"] = round(g_margin / g_amount, ROUND) if g_amount else None
+            rows.append(row)
+        return rows
+
+    product_cols = "p.drawing_no, p.name"
+    if with_qty:
+        product_cols += f", {qty_sql} AS sale_qty"
+    by_product = _margin_rows(
+        f"SELECT {product_cols}, {amount_sql} AS amount, {cost_sql} AS cost"
+        f" FROM transactions t JOIN products p ON p.id = t.product_id"
+        f" WHERE t.biz_type IN ('sale', 'sale_return') AND {cond}"
+        f" GROUP BY t.product_id",
+        params,
+    )
+    by_product.sort(key=lambda g: (-g["margin"], g["drawing_no"]))
+    by_customer = _margin_rows(
+        f"SELECT cp.name AS customer, {amount_sql} AS amount, {cost_sql} AS cost"
+        f" FROM transactions t LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
+        f" WHERE t.biz_type IN ('sale', 'sale_return') AND {cond}"
+        f" GROUP BY cp.name",
+        params,
+    )
+    by_customer.sort(key=lambda g: (-g["margin"], g["customer"] or ""))
+    return amount, cost, by_product, by_customer
+
+
 def query_margin(
     conn: sqlite3.Connection,
     from_date: str | None = None,
@@ -887,19 +989,9 @@ def query_margin(
       毛利率 = 毛利 ÷ 售出金额（无售出时 null）。
     - 分组：按产品（图号/名称）与按客户（现结归入 customer=null 组），均为
       金额/成本/毛利/毛利率、毛利降序；--product/--customer 过滤作用于全报表。
+    - 分组计算复用 _margin_grouped（与 report period / export 毛利 sheet 同口径）。
     """
-    today = datetime.date.today()
-    if from_date is None and to_date is None:
-        from_date = f"{today.year:04d}-{today.month:02d}-01"
-        to_date = today.isoformat()
-    elif from_date is None or to_date is None:
-        raise BusinessError("参数缺失: --from 与 --to 须成对给出（缺省默认本月）")
-    else:
-        from_date, to_date = from_date.strip(), to_date.strip()
-        if not (DATE_RE.match(from_date) and DATE_RE.match(to_date)):
-            raise BusinessError("日期格式应为 YYYY-MM-DD")
-        if from_date > to_date:
-            raise BusinessError("起始日期不能晚于截止日期")
+    from_date, to_date = _parse_period(from_date, to_date)
 
     product_id = None
     if product:
@@ -921,59 +1013,7 @@ def query_margin(
         cond += " AND t.counterparty_id = ?"
         params.append(cp_id)
 
-    amount = 0.0
-    cost = 0.0
-    for t in conn.execute(
-        f"SELECT biz_type, qty, price, cost FROM transactions t"
-        f" WHERE t.biz_type IN ('sale', 'sale_return') AND {cond}",
-        params,
-    ).fetchall():
-        sign = -1 if t["biz_type"] == "sale_return" else 1
-        amount += sign * t["qty"] * t["price"]
-        cost += sign * t["qty"] * (t["cost"] or 0.0)
-
-    amount_sql = (
-        "SUM(CASE WHEN t.biz_type = 'sale' THEN t.qty * t.price"
-        "         ELSE -t.qty * t.price END)"
-    )
-    cost_sql = (
-        "SUM(CASE WHEN t.biz_type = 'sale' THEN t.qty * COALESCE(t.cost, 0)"
-        "         ELSE -t.qty * COALESCE(t.cost, 0) END)"
-    )
-
-    def _margin_rows(sql: str, params: list[Any]) -> list[dict[str, Any]]:
-        rows = []
-        for r in conn.execute(sql, params).fetchall():
-            g_amount = r["amount"]
-            g_cost = r["cost"]
-            g_margin = g_amount - g_cost
-            row = dict(r)
-            row.pop("amount", None)
-            row.pop("cost", None)
-            row["amount"] = round(g_amount, ROUND)
-            row["cost"] = round(g_cost, ROUND)
-            row["margin"] = round(g_margin, ROUND)
-            row["margin_rate"] = round(g_margin / g_amount, ROUND) if g_amount else None
-            rows.append(row)
-        return rows
-
-    by_product = _margin_rows(
-        f"SELECT p.drawing_no, p.name, {amount_sql} AS amount, {cost_sql} AS cost"
-        f" FROM transactions t JOIN products p ON p.id = t.product_id"
-        f" WHERE t.biz_type IN ('sale', 'sale_return') AND {cond}"
-        f" GROUP BY t.product_id",
-        params,
-    )
-    by_product.sort(key=lambda g: (-g["margin"], g["drawing_no"]))
-    by_customer = _margin_rows(
-        f"SELECT cp.name AS customer, {amount_sql} AS amount, {cost_sql} AS cost"
-        f" FROM transactions t LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
-        f" WHERE t.biz_type IN ('sale', 'sale_return') AND {cond}"
-        f" GROUP BY cp.name",
-        params,
-    )
-    by_customer.sort(key=lambda g: (-g["margin"], g["customer"] or ""))
-
+    amount, cost, by_product, by_customer = _margin_grouped(conn, cond, params)
     margin = amount - cost
     return {
         "from": from_date,
@@ -1021,11 +1061,20 @@ def record_opening(
     }
 
 
-def _stock_state(conn: sqlite3.Connection, product_id: int) -> tuple[float, float, float]:
-    """重放期初 + 流水，现算某商品的 (当前数量, 当前加权均价, 结存金额)（ADR 0001/0004）。
+def _stock_state(
+    conn: sqlite3.Connection,
+    product_id: int,
+    *,
+    before_date: str | None = None,
+    until_date: str | None = None,
+) -> tuple[float, float, float]:
+    """重放期初 + 流水，现算某商品的 (数量, 当前加权均价, 结存金额)（ADR 0001/0004）。
 
     期初行按录入序聚合为基数（数量 Σqty、金额 Σqty×cost）；流水按
     biz_date + id（同日按录入序）逐笔推进，只有进货改变结存金额与数量并重算均价。
+    before_date 时只推进 biz_date < before_date 的流水（周期汇总期初口径）、
+    until_date 时只推进 biz_date <= until_date 的流水（周期汇总期末口径）；
+    两者缺省 = 全历史（当前状态）。
     售出/红冲分支（sale/purchase_return/sale_return）镜像 T1 数量 SQL 的符号方向，
     待 T3/T5 开放对应写入命令后自然生效；当前均价 = 结存金额 ÷ 结存数量。
     结存金额保持全精度，供金额列直接取用，避免 qty×avg 重算引入舍入差。
@@ -1038,10 +1087,18 @@ def _stock_state(conn: sqlite3.Connection, product_id: int) -> tuple[float, floa
     ):
         qty += o["qty"]
         amount += o["qty"] * (o["cost"] or 0.0)
+    tx_cond = "product_id = ?"
+    tx_params: list[Any] = [product_id]
+    if before_date is not None:
+        tx_cond += " AND biz_date < ?"
+        tx_params.append(before_date)
+    if until_date is not None:
+        tx_cond += " AND biz_date <= ?"
+        tx_params.append(until_date)
     for t in conn.execute(
-        "SELECT biz_type, qty, price, cost FROM transactions"
-        " WHERE product_id = ? ORDER BY biz_date, id",
-        (product_id,),
+        f"SELECT biz_type, qty, price, cost FROM transactions"
+        f" WHERE {tx_cond} ORDER BY biz_date, id",
+        tx_params,
     ):
         bt = t["biz_type"]
         q, price, cost = t["qty"], t["price"], t["cost"]
@@ -1090,3 +1147,180 @@ def query_stock(
             }
         )
     return rows
+
+
+def export_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
+    """整库快照数据（spec D6 导出 5-Sheet，导出时点现算，口径已确认）。
+
+    - transactions: 全部业务流水（biz_date/id 序），退货带红冲原单信息（ref）。
+    - products: 图号/名称/单位/别名（、拼接，别名按录入序）。
+    - counterparties: 名称/类型标记/挂账标记/联系方式（地区+电话拼接）。
+    - stock: 当前库存（复用 query_stock 现算）。
+    - margin: 按产品分组的全历史毛利汇总（整库快照语义，毛利降序）。
+    """
+    flow = []
+    for r in conn.execute(
+        "SELECT t.id, t.biz_date, t.biz_type, t.qty, t.price, t.freight, t.cost,"
+        "       t.note, t.ref_id, p.drawing_no, p.name, p.unit,"
+        "       cp.name AS counterparty,"
+        "       o.biz_date AS ref_biz_date, o.biz_type AS ref_biz_type"
+        " FROM transactions t"
+        " JOIN products p ON p.id = t.product_id"
+        " LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
+        " LEFT JOIN transactions o ON o.id = t.ref_id"
+        " ORDER BY t.biz_date, t.id"
+    ).fetchall():
+        flow.append(
+            {
+                "id": r["id"],
+                "biz_date": r["biz_date"],
+                "biz_type": r["biz_type"],
+                "drawing_no": r["drawing_no"],
+                "name": r["name"],
+                "unit": r["unit"],
+                "qty": round(r["qty"], ROUND),
+                "price": r["price"],
+                "amount": round(r["qty"] * r["price"], ROUND),
+                "freight": round(r["freight"] or 0.0, ROUND),
+                "cost": round(r["cost"], ROUND) if r["cost"] is not None else None,
+                "counterparty": r["counterparty"],
+                "note": r["note"],
+                "ref": _ref_dict(r),
+            }
+        )
+
+    products_rows = []
+    for r in conn.execute(
+        "SELECT p.drawing_no, p.name, p.unit,"
+        " (SELECT GROUP_CONCAT(alias, '、') FROM (SELECT alias FROM aliases"
+        "   WHERE product_id = p.id ORDER BY id)) AS aliases"
+        " FROM products p ORDER BY p.drawing_no"
+    ).fetchall():
+        products_rows.append(
+            {
+                "drawing_no": r["drawing_no"],
+                "name": r["name"],
+                "unit": r["unit"],
+                "aliases": r["aliases"] or "",
+            }
+        )
+
+    cp_rows = []
+    for r in conn.execute(
+        "SELECT name, is_customer, is_supplier, is_credit, region, phone"
+        " FROM counterparties ORDER BY name"
+    ).fetchall():
+        roles = []
+        if r["is_customer"]:
+            roles.append("客户")
+        if r["is_supplier"]:
+            roles.append("供应商")
+        cp_rows.append(
+            {
+                "name": r["name"],
+                "roles": "+".join(roles),
+                "is_credit": r["is_credit"],
+                "contact": f"{r['region'] or ''} {r['phone'] or ''}".strip(),
+            }
+        )
+
+    # 毛利 sheet：按产品分组的全历史毛利汇总（口径已确认：整库快照语义）
+    _, _, margin_rows, _ = _margin_grouped(conn, "1 = 1", [])
+    return {
+        "transactions": flow,
+        "products": products_rows,
+        "counterparties": cp_rows,
+        "stock": query_stock(conn),
+        "margin": margin_rows,
+    }
+
+
+def period_report(
+    conn: sqlite3.Connection,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> dict[str, Any]:
+    """周期汇总数据（spec D6 周期汇总四块，周/月/年同一套结构、仅区间不同）。
+
+    - 期间：--from/--to 成对给出、缺省默认本月（与 query margin 同规则）；起≤止。
+    - 汇总：进货/售出笔数与金额按期间退货净额冲减（与日报同口径）；运费按类型单列
+      求和（进货只加 purchase 行、售出只加 sale 行，退货 freight=0）；毛利 =
+      售出净额 − 成本快照净额（复用 _margin_grouped，运费不进毛利）。
+    - 期初/期末库存金额（口径已确认）：期初 = 截止 from 前一日（biz_date < from）
+      重放现算、期末 = 截止 to（biz_date <= to）重放现算，按全部商品合计；
+      期初录入恒为基数。期末 − 期初 = 期间净业务变动，与期间汇总自洽。
+    - 分组：按产品（含售出数量列）/按客户，毛利降序（TOP 10 由写入侧截取）。
+    - 明细：期间全部流水逐笔（biz_date/id 序，形状同日报明细，退货带红冲原单标记）。
+    """
+    from_date, to_date = _parse_period(from_date, to_date)
+
+    tx_rows = conn.execute(
+        "SELECT biz_type, qty, price, freight, cost FROM transactions"
+        " WHERE biz_date BETWEEN ? AND ?"
+        " AND biz_type IN ('purchase', 'sale', 'purchase_return', 'sale_return')",
+        (from_date, to_date),
+    ).fetchall()
+
+    def _net(kind: str, ret_kind: str) -> tuple[int, float, float]:
+        count = 0
+        amount = 0.0
+        freight = 0.0
+        for t in tx_rows:
+            if t["biz_type"] == kind:
+                sign = 1
+                freight += t["freight"] or 0.0
+            elif t["biz_type"] == ret_kind:
+                sign = -1
+            else:
+                continue
+            count += sign
+            amount += sign * t["qty"] * t["price"]
+        return count, amount, freight
+
+    p_count, p_amount, p_freight = _net("purchase", "purchase_return")
+    s_count, s_amount, s_freight = _net("sale", "sale_return")
+
+    cond = "t.biz_date BETWEEN ? AND ?"
+    params: list[Any] = [from_date, to_date]
+    amount, cost, by_product, by_customer = _margin_grouped(
+        conn, cond, params, with_qty=True
+    )
+
+    opening_inventory = 0.0
+    closing_inventory = 0.0
+    for p in conn.execute("SELECT id FROM products").fetchall():
+        opening_inventory += _stock_state(conn, p["id"], before_date=from_date)[2]
+        closing_inventory += _stock_state(conn, p["id"], until_date=to_date)[2]
+
+    details = []
+    for r in conn.execute(
+        "SELECT t.id, t.biz_date, t.biz_type, t.qty, t.price, t.ref_id,"
+        "       p.drawing_no, p.name, p.unit, cp.name AS counterparty,"
+        "       o.biz_date AS ref_biz_date, o.biz_type AS ref_biz_type"
+        " FROM transactions t"
+        " JOIN products p ON p.id = t.product_id"
+        " LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
+        " LEFT JOIN transactions o ON o.id = t.ref_id"
+        " WHERE t.biz_date BETWEEN ? AND ?"
+        " AND t.biz_type IN ('purchase', 'sale', 'purchase_return', 'sale_return')"
+        " ORDER BY t.biz_date, t.id",
+        (from_date, to_date),
+    ).fetchall():
+        details.append(_detail_dict(r))
+
+    return {
+        "from": from_date,
+        "to": to_date,
+        "summary": {
+            "purchase": {"count": p_count, "amount": round(p_amount, ROUND),
+                         "freight": round(p_freight, ROUND)},
+            "sale": {"count": s_count, "amount": round(s_amount, ROUND),
+                     "freight": round(s_freight, ROUND)},
+            "margin": round(amount - cost, ROUND),
+            "opening_inventory": round(opening_inventory, ROUND),
+            "closing_inventory": round(closing_inventory, ROUND),
+        },
+        "by_product": by_product,
+        "by_customer": by_customer,
+        "details": details,
+    }
