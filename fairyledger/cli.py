@@ -43,6 +43,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_purchase.add_argument("--date", help="业务日期 YYYY-MM-DD，缺省今天")
     p_purchase.add_argument("--note", help="备注，可空")
 
+    p_sale = sub.add_parser("sale", help="售出")
+    p_sale.add_argument("--drawing-no", help="图号（必填）")
+    p_sale.add_argument("--qty", type=float, help="数量（必填，正数）")
+    p_sale.add_argument("--price", type=float,
+                        help="售价；缺省自动带出该客户该商品上次成交价直接填写")
+    p_sale.add_argument("--customer", help="客户名称；缺省现结不挂账")
+    p_sale.add_argument("--credit", action="store_true",
+                        help="挂账：落库同时置往来单位挂账标记（须有客户）")
+    p_sale.add_argument("--freight", type=float, help="运费，可空默认 0")
+    p_sale.add_argument("--date", help="业务日期 YYYY-MM-DD，缺省今天")
+    p_sale.add_argument("--note", help="备注，可空")
+
     p_opening = sub.add_parser("opening", help="期初库存录入（追加语义，可多次）")
     p_opening.add_argument("--drawing-no", help="图号（必填）")
     p_opening.add_argument("--qty", type=float, help="数量（必填，正数）")
@@ -52,6 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_query_sub = p_query.add_subparsers(dest="subcommand", metavar="<子命令>")
     p_stock = p_query_sub.add_parser("stock", help="当前库存")
     p_stock.add_argument("--drawing-no", help="按图号过滤")
+    p_price = p_query_sub.add_parser("price", help="报价参考（历史成交价+成本快照）")
+    p_price.add_argument("--drawing-no", help="图号（必填）")
+    p_price.add_argument("--customer", help="按客户过滤")
+    p_price.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
+    p_price.add_argument("--to", dest="to_date", help="截止日期 YYYY-MM-DD")
     p_search = p_query_sub.add_parser("product", help="商品检索（歧义消解）")
     p_search.add_argument("--q", help="检索词：图号精确优先，否则词段 AND 匹配")
     return parser
@@ -96,10 +113,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.freight, args.supplier, args.date, args.note,
                     )
                 )
+            elif args.command == "sale":
+                _emit(
+                    ledger.record_sale(
+                        conn, args.drawing_no, args.qty, args.price,
+                        args.customer, args.credit, args.freight,
+                        args.date, args.note,
+                    )
+                )
             elif args.command == "opening":
                 _emit(ledger.record_opening(conn, args.drawing_no, args.qty, args.cost))
             elif args.command == "query" and args.subcommand == "stock":
                 _emit(ledger.query_stock(conn, args.drawing_no))
+            elif args.command == "query" and args.subcommand == "price":
+                _emit(ledger.query_price(conn, args.drawing_no, args.customer,
+                                         args.from_date, args.to_date))
             elif args.command == "query" and args.subcommand == "product":
                 q = (args.q or "").strip()
                 if not q:

@@ -113,6 +113,16 @@ class T1Base(unittest.TestCase):
         self.assertEqual(len(rows), 1, f"应恰好一行: {rows}")
         return rows[0]
 
+    def sale(self, *args: str) -> dict:
+        cp = self.fairy("sale", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
+    def price_rows(self, *args: str) -> list[dict]:
+        cp = self.fairy("query", "price", *args)
+        self.assertEqual(cp.returncode, 0, f"stderr: {cp.stderr}")
+        return json.loads(cp.stdout)
+
 
 class TestSchemaInit(T1Base):
     def test_empty_db_initializes_all_tables_and_indexes(self):
@@ -510,6 +520,238 @@ class TestStockCost(T1Base):
         self.assertEqual(rows[0]["qty"], 2.0)
         self.assertEqual(rows[0]["unit_cost"], 5.0)
         self.assertEqual(rows[0]["amount"], 10.0)
+
+
+class TestSale(T1Base):
+    """T3 售出：成本快照、现结缺省、挂账标记、缺单价带出上次成交价。"""
+
+    def _seed(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+        self.opening("--drawing-no", "170", "--qty", "10", "--cost", "4")
+
+    def test_qty_and_drawing_no_required(self):
+        self._seed()
+        for args in (
+            ("--drawing-no", "170", "--price", "10"),
+            ("--qty", "3", "--price", "10"),
+            ("--qty", "3", "--drawing-no", "170"),
+        ):
+            cp = self.fairy("sale", *args)
+            self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+            self.assertIn("参数缺失", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 0,
+                         "参数缺失不应落任何流水")
+
+    def test_unknown_product_exit1_atomic(self):
+        cp = self.fairy("sale", "--drawing-no", "NOPE", "--qty", "3",
+                        "--price", "10", "--customer", "乙店")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("无此商品", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 0)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM counterparties")[0][0], 0,
+                         "中途失败不应留下客户档案")
+
+    def test_basic_sale_cash_default_and_cost_snapshot(self):
+        self._seed()
+        out = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        self.assertEqual(out["biz_type"], "sale")
+        self.assertEqual(out["qty"], 3.0)
+        self.assertEqual(out["price"], 15.0)
+        self.assertEqual(out["cost"], 4.0, "成本列 = 售出时加权均价快照")
+        self.assertEqual(out["freight"], 0.0, "运费可空默认 0")
+        self.assertEqual(out["biz_date"], datetime.date.today().isoformat(), "日期缺省今天")
+        self.assertIsNone(out["customer"], "缺客户默认现结不挂账")
+        self.assertIs(out["credit"], False)
+        self.assertNotIn("price_auto", out, "显式给价不标自动带出")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 7.0, "售出后库存数量减少")
+        self.assertEqual(row["unit_cost"], 4.0, "售出不触发均价重算")
+        self.assertEqual(row["amount"], 28.0)
+
+    def test_sale_snapshot_uses_current_weighted_avg(self):
+        self._seed()
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10")  # 均价 → 6
+        out = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        self.assertEqual(out["cost"], 6.0, "快照取当时加权均价 (40+50)/15")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 12.0)
+        self.assertEqual(row["unit_cost"], 6.0)
+        self.assertEqual(row["amount"], 72.0)
+
+    def test_sale_does_not_recompute_avg_frozen_snapshot(self):
+        self._seed()
+        out = self.sale("--drawing-no", "170", "--qty", "3", "--price", "15")
+        self.assertEqual(out["cost"], 4.0)
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "10")
+        row = self.stock_row("170")
+        self.assertEqual(row["qty"], 12.0)
+        self.assertEqual(row["unit_cost"], 6.5, "后续进货按 (28+50)/12 重算")
+        self.assertEqual(row["amount"], 78.0)
+        rows = self.price_rows("--drawing-no", "170")
+        self.assertEqual(rows[0]["cost"], 4.0, "已快照成本不受后续进货影响")
+
+    def test_customer_create_or_resolve(self):
+        self._seed()
+        out = self.sale("--drawing-no", "170", "--qty", "1", "--price", "10",
+                        "--customer", "乙店")
+        self.assertEqual(out["customer"], "乙店")
+        self.assertIs(out["credit"], False)
+        self.assertEqual(self.query_db(
+            "SELECT name, is_customer, is_supplier, is_credit FROM counterparties"),
+            [("乙店", 1, 0, 0)], "新客户自动建档并打客户标记，现结不挂账")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "10", "--customer", "乙店")
+        self.assertEqual(len(self.query_db("SELECT id FROM counterparties")), 1,
+                         "同名客户复用，不重复建档")
+
+    def test_credit_sets_is_credit(self):
+        self._seed()
+        out = self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                        "--customer", "乙店", "--credit")
+        self.assertIs(out["credit"], True)
+        self.assertEqual(self.query_db(
+            "SELECT is_customer, is_credit FROM counterparties WHERE name = '乙店'"),
+            [(1, 1)], "--credit 同时置往来单位挂账标记")
+
+    def test_credit_requires_customer(self):
+        self._seed()
+        cp = self.fairy("sale", "--drawing-no", "170", "--qty", "2",
+                        "--price", "10", "--credit")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("客户", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 0)
+
+    def test_price_auto_fill_last_trade_and_echo(self):
+        self._seed()
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "50", "--customer", "乙店")
+        out = self.sale("--drawing-no", "170", "--qty", "1", "--customer", "乙店")
+        self.assertEqual(out["price"], 50.0, "缺单价带出该客户该商品上次成交价直接写入")
+        self.assertIs(out["price_auto"], True)
+        self.assertEqual(self.query_db(
+            "SELECT price FROM transactions WHERE biz_type='sale' ORDER BY id DESC LIMIT 1"),
+            [(50.0,)], "带出的价格确实写入库中")
+
+    def test_price_auto_fill_scoped_by_customer_and_product(self):
+        self._seed()
+        self.add_product("--drawing-no", "171", "--name", "活塞环")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "50", "--customer", "乙店")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "70", "--customer", "丙店")
+        self.sale("--drawing-no", "171", "--qty", "1", "--price", "100", "--customer", "乙店")
+        out = self.sale("--drawing-no", "170", "--qty", "1", "--customer", "丙店")
+        self.assertEqual(out["price"], 70.0, "按客户过滤取该客户该商品上次成交价")
+        out = self.sale("--drawing-no", "170", "--qty", "1", "--customer", "乙店")
+        self.assertEqual(out["price"], 50.0, "不被其他产品的成交价干扰")
+
+    def test_price_missing_no_history_must_ask(self):
+        self._seed()
+        for args in (
+            ("--drawing-no", "170", "--qty", "3"),
+            ("--drawing-no", "170", "--qty", "3", "--customer", "乙店"),
+        ):
+            cp = self.fairy("sale", *args)
+            self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+            self.assertIn("参数缺失", cp.stderr)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 0,
+                         "无历史必问，不落流水")
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM counterparties")[0][0], 0,
+                         "无历史失败时新建客户一并回滚")
+
+    def test_negative_price_rejected(self):
+        self._seed()
+        cp = self.fairy("sale", "--drawing-no", "170", "--qty", "2", "--price", "-5")
+        self.assertEqual(cp.returncode, 1)
+        self.assertEqual(self.query_db("SELECT COUNT(*) FROM transactions")[0][0], 0)
+
+    def test_freight_date_note_filled(self):
+        self._seed()
+        out = self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                        "--freight", "20", "--date", "2026-08-01", "--note", "加急")
+        self.assertEqual(out["freight"], 20.0)
+        self.assertEqual(out["biz_date"], "2026-08-01")
+        self.assertEqual(out["note"], "加急")
+        self.assertEqual(out["cost"], 4.0, "售出运费不影响成本快照")
+
+    def test_invalid_date_rejected(self):
+        self._seed()
+        cp = self.fairy("sale", "--drawing-no", "170", "--qty", "2",
+                        "--price", "10", "--date", "2026/08/01")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("日期格式", cp.stderr)
+
+
+class TestQueryPrice(T1Base):
+    """T3 报价参考：历史成交价 + 成本快照列，产品/客户/日期组合筛选、日期降序。"""
+
+    def _seed_sales(self):
+        self.add_product("--drawing-no", "170", "--name", "活塞", "--unit", "件")
+        self.opening("--drawing-no", "170", "--qty", "20", "--cost", "4")
+        self.sale("--drawing-no", "170", "--qty", "2", "--price", "10",
+                  "--date", "2026-08-01", "--customer", "乙店", "--note", "首批")
+        self.sale("--drawing-no", "170", "--qty", "3", "--price", "12",
+                  "--date", "2026-08-05")
+        self.sale("--drawing-no", "170", "--qty", "1", "--price", "15",
+                  "--date", "2026-08-10", "--customer", "乙店")
+
+    def test_requires_drawing_no(self):
+        self._seed_sales()
+        for args in ((), ("--from", "2026-08-01")):
+            cp = self.fairy("query", "price", *args)
+            self.assertEqual(cp.returncode, 1, f"stderr: {cp.stderr}")
+            self.assertIn("参数缺失", cp.stderr)
+
+    def test_sales_desc_with_cost_snapshot_columns(self):
+        self._seed_sales()
+        rows = self.price_rows("--drawing-no", "170")
+        self.assertEqual([r["biz_date"] for r in rows],
+                         ["2026-08-10", "2026-08-05", "2026-08-01"], "日期降序")
+        first = rows[0]
+        self.assertEqual(set(first),
+                         {"id", "biz_date", "drawing_no", "name", "unit",
+                          "qty", "price", "amount", "cost", "customer", "note"})
+        self.assertEqual(first["drawing_no"], "170")
+        self.assertEqual(first["name"], "活塞")
+        self.assertEqual(first["unit"], "件")
+        self.assertEqual(first["qty"], 1.0)
+        self.assertEqual(first["price"], 15.0)
+        self.assertEqual(first["amount"], 15.0, "金额 qty×price 现算")
+        self.assertEqual(first["cost"], 4.0, "含该笔成交的成本快照列")
+        self.assertEqual(first["customer"], "乙店")
+        self.assertIsNone(rows[1]["customer"], "现结售出客户为空")
+        self.assertIsNone(rows[1]["note"])
+        self.assertEqual(rows[2]["note"], "首批")
+
+    def test_price_excludes_purchases(self):
+        self._seed_sales()
+        self.purchase("--drawing-no", "170", "--qty", "5", "--price", "9",
+                      "--date", "2026-08-12")
+        rows = self.price_rows("--drawing-no", "170")
+        self.assertEqual(len(rows), 3, "进货不是成交，不进入报价参考")
+        self.assertNotIn("2026-08-12", [r["biz_date"] for r in rows])
+
+    def test_price_filter_by_customer(self):
+        self._seed_sales()
+        rows = self.price_rows("--drawing-no", "170", "--customer", "乙店")
+        self.assertEqual([r["biz_date"] for r in rows], ["2026-08-10", "2026-08-01"])
+        self.assertTrue(all(r["customer"] == "乙店" for r in rows))
+
+    def test_price_filter_by_date_range(self):
+        self._seed_sales()
+        rows = self.price_rows("--drawing-no", "170",
+                               "--from", "2026-08-05", "--to", "2026-08-10")
+        self.assertEqual([r["biz_date"] for r in rows], ["2026-08-10", "2026-08-05"])
+        rows = self.price_rows("--drawing-no", "170",
+                               "--from", "2026-08-10", "--to", "2026-08-10")
+        self.assertEqual([r["biz_date"] for r in rows], ["2026-08-10"], "区间含边界")
+
+    def test_price_empty_for_unknown_filters(self):
+        self._seed_sales()
+        self.assertEqual(self.price_rows("--drawing-no", "NOPE"), [])
+        self.assertEqual(self.price_rows("--drawing-no", "170", "--customer", "没买过"), [])
+
+    def test_price_invalid_date_rejected(self):
+        self._seed_sales()
+        cp = self.fairy("query", "price", "--drawing-no", "170", "--from", "2026/08/01")
+        self.assertEqual(cp.returncode, 1)
+        self.assertIn("日期格式", cp.stderr)
 
 
 if __name__ == "__main__":

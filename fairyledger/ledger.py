@@ -1,6 +1,6 @@
-"""流水与库存成本：进货/期初录入写入、当前库存与移动加权均价现算（spec D2 + ADR 0004）。
+"""流水与库存成本：进货/售出/期初录入写入、当前库存与移动加权均价现算（spec D2 + ADR 0004）。
 
-- 写入命令（purchase/opening）单事务原子：商品查证、往来单位解析、流水落库一体，
+- 写入命令（purchase/sale/opening）单事务原子：商品查证、往来单位解析、流水落库一体，
   中途失败不留半截数据。
 - 派生值一律现算（ADR 0001）：当前数量 = 期初合计 + 流水净量，当前加权均价 =
   结存金额 ÷ 结存数量，均不落列。
@@ -54,20 +54,68 @@ def _require_product(
     return row
 
 
-def _resolve_supplier(conn: sqlite3.Connection, name: str) -> int:
-    """供应商按名称 create-or-resolve：同名复用并打供应商标记，不存在自动建档。"""
+def _resolve_counterparty(
+    conn: sqlite3.Connection,
+    name: str,
+    *,
+    customer: bool = False,
+    supplier: bool = False,
+    credit: bool = False,
+) -> int:
+    """往来单位按名称 create-or-resolve（CONTEXT：单表，客户/供应商可同时勾选）。
+
+    同名复用并补打标记（不清除已有标记：现结售给挂账客户不改变其档案状态）；
+    不存在自动建档。credit 只置位、从不清除。
+    """
     row = conn.execute(
         "SELECT id FROM counterparties WHERE name = ? COLLATE NOCASE", (name,)
     ).fetchone()
     if row is not None:
         conn.execute(
-            "UPDATE counterparties SET is_supplier = 1 WHERE id = ?", (row["id"],)
+            "UPDATE counterparties SET"
+            " is_customer = CASE WHEN ? THEN 1 ELSE is_customer END,"
+            " is_supplier = CASE WHEN ? THEN 1 ELSE is_supplier END,"
+            " is_credit = CASE WHEN ? THEN 1 ELSE is_credit END"
+            " WHERE id = ?",
+            (1 if customer else 0, 1 if supplier else 0, 1 if credit else 0, row["id"]),
         )
         return row["id"]
     cur = conn.execute(
-        "INSERT INTO counterparties (name, is_supplier) VALUES (?, 1)", (name,)
+        "INSERT INTO counterparties (name, is_customer, is_supplier, is_credit)"
+        " VALUES (?, ?, ?, ?)",
+        (name, 1 if customer else 0, 1 if supplier else 0, 1 if credit else 0),
     )
     return cur.lastrowid
+
+
+def _normalize_freight(freight: float | None) -> float:
+    """运费：可空默认 0；不能为负。"""
+    freight = 0.0 if freight is None else freight
+    if freight < 0:
+        raise BusinessError("运费不能为负")
+    return freight
+
+
+def _normalize_date(date: str | None) -> str:
+    """业务日期：缺省今天；格式必须 YYYY-MM-DD（防脏数据破坏流水排序）。"""
+    biz_date = datetime.date.today().isoformat() if date is None else date.strip()
+    if not DATE_RE.match(biz_date):
+        raise BusinessError("日期格式应为 YYYY-MM-DD")
+    return biz_date
+
+
+def _tx_with_product(
+    conn: sqlite3.Connection, tx_id: int, product: sqlite3.Row, **extra: Any
+) -> dict[str, Any]:
+    """流水完整行 + 商品要素富化，供写入命令回显（spec D5 输出契约）。"""
+    row = conn.execute("SELECT * FROM transactions WHERE id = ?", (tx_id,)).fetchone()
+    return {
+        **dict(row),
+        "drawing_no": product["drawing_no"],
+        "name": product["name"],
+        "unit": product["unit"],
+        **extra,
+    }
 
 
 def record_purchase(
@@ -91,18 +139,12 @@ def record_purchase(
         raise BusinessError("参数缺失: --price")
     if price < 0:
         raise BusinessError("进价不能为负")
-    freight = 0.0 if freight is None else freight
-    if freight < 0:
-        raise BusinessError("运费不能为负")
-    biz_date = (
-        datetime.date.today().isoformat() if date is None else date.strip()
-    )
-    if not DATE_RE.match(biz_date):
-        raise BusinessError("日期格式应为 YYYY-MM-DD")
+    freight = _normalize_freight(freight)
+    biz_date = _normalize_date(date)
     supplier = (supplier or "").strip()
     with conn:
         product = _require_product(conn, drawing_no)
-        cp_id = _resolve_supplier(conn, supplier) if supplier else None
+        cp_id = _resolve_counterparty(conn, supplier, supplier=True) if supplier else None
         cur = conn.execute(
             "INSERT INTO transactions"
             " (biz_date, biz_type, product_id, qty, price, freight,"
@@ -111,14 +153,137 @@ def record_purchase(
             (biz_date, product["id"], qty, price, freight, cp_id, note),
         )
         tx_id = cur.lastrowid
-    row = conn.execute("SELECT * FROM transactions WHERE id = ?", (tx_id,)).fetchone()
-    return {
-        **dict(row),
-        "drawing_no": product["drawing_no"],
-        "name": product["name"],
-        "unit": product["unit"],
-        "supplier": supplier or None,
-    }
+    return _tx_with_product(conn, tx_id, product, supplier=supplier or None)
+
+
+def _last_sale_price(
+    conn: sqlite3.Connection, product_id: int, counterparty_id: int | None
+) -> float | None:
+    """该商品（可限定客户）最近一笔成交价：日期降序取第一条（报价参考语义，spec D6）。"""
+    sql = "SELECT price FROM transactions WHERE biz_type = 'sale' AND product_id = ?"
+    params: list[Any] = [product_id]
+    if counterparty_id is not None:
+        sql += " AND counterparty_id = ?"
+        params.append(counterparty_id)
+    sql += " ORDER BY biz_date DESC, id DESC LIMIT 1"
+    row = conn.execute(sql, params).fetchone()
+    return row["price"] if row is not None else None
+
+
+def record_sale(
+    conn: sqlite3.Connection,
+    drawing_no: str | None,
+    qty: float | None,
+    price: float | None,
+    customer: str | None,
+    credit: bool,
+    freight: float | None,
+    date: str | None,
+    note: str | None,
+) -> dict[str, Any]:
+    """录一笔售出流水（biz_type=sale）。
+
+    数量必填；客户缺省现结不挂账（挂账需明说 --credit，且须有客户）；缺单价自动带出
+    该客户该商品上次成交价直接写入（price_auto 标记供 Fairy 回显），无历史则必问；
+    成本列 = 售出当时加权均价快照，售出不触发均价重算（spec D2/D3 + ADR 0004）。
+    """
+    drawing_no = _require_drawing_no(drawing_no)
+    qty = _require_positive_qty(qty)
+    credit = bool(credit)
+    customer = (customer or "").strip()
+    if credit and not customer:
+        raise BusinessError("挂账需指定客户: --credit 需要 --customer")
+    freight = _normalize_freight(freight)
+    biz_date = _normalize_date(date)
+    with conn:
+        product = _require_product(conn, drawing_no)
+        cp_id = (
+            _resolve_counterparty(conn, customer, customer=True, credit=credit)
+            if customer else None
+        )
+        price_auto = False
+        if price is None:
+            last = _last_sale_price(conn, product["id"], cp_id)
+            if last is None:
+                raise BusinessError(
+                    "参数缺失: --price（该客户该商品无历史成交价可带出，需询问售价）"
+                )
+            price = last
+            price_auto = True
+        if price < 0:
+            raise BusinessError("售价不能为负")
+        # 成本快照 = 售出时加权均价；无期初无进货时均价未定义、取 0（D2：快照一律取当时均价）
+        _, avg, _ = _stock_state(conn, product["id"])
+        cur = conn.execute(
+            "INSERT INTO transactions"
+            " (biz_date, biz_type, product_id, qty, price, freight, cost,"
+            "  counterparty_id, note)"
+            " VALUES (?, 'sale', ?, ?, ?, ?, ?, ?, ?)",
+            (biz_date, product["id"], qty, price, freight, avg, cp_id, note),
+        )
+        tx_id = cur.lastrowid
+    return _tx_with_product(
+        conn, tx_id, product,
+        customer=customer or None,
+        credit=credit,
+        **({"price_auto": True} if price_auto else {}),
+    )
+
+
+def query_price(
+    conn: sqlite3.Connection,
+    drawing_no: str | None,
+    customer: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """报价参考：历史成交价列表（sale 流水），含每笔成交的成本快照，日期降序。
+
+    列 = 日期/图号/名称/数量+单位/单价/金额/成本快照/客户/备注；筛选 = 产品/客户/日期
+    任意组合；日期降序第一条即上次成交价（spec D6）。
+    """
+    drawing_no = _require_drawing_no(drawing_no)
+    for d in (from_date, to_date):
+        if d is not None and not DATE_RE.match(d.strip()):
+            raise BusinessError("日期格式应为 YYYY-MM-DD")
+    sql = (
+        "SELECT t.id, t.biz_date, t.qty, t.price, t.cost, t.note,"
+        " p.drawing_no, p.name, p.unit, cp.name AS customer"
+        " FROM transactions t"
+        " JOIN products p ON p.id = t.product_id"
+        " LEFT JOIN counterparties cp ON cp.id = t.counterparty_id"
+        " WHERE t.biz_type = 'sale' AND p.drawing_no = ? COLLATE NOCASE"
+    )
+    params: list[Any] = [drawing_no]
+    customer = (customer or "").strip()
+    if customer:
+        sql += " AND cp.name = ? COLLATE NOCASE"
+        params.append(customer)
+    if from_date is not None:
+        sql += " AND t.biz_date >= ?"
+        params.append(from_date.strip())
+    if to_date is not None:
+        sql += " AND t.biz_date <= ?"
+        params.append(to_date.strip())
+    sql += " ORDER BY t.biz_date DESC, t.id DESC"
+    rows = []
+    for r in conn.execute(sql, params).fetchall():
+        rows.append(
+            {
+                "id": r["id"],
+                "biz_date": r["biz_date"],
+                "drawing_no": r["drawing_no"],
+                "name": r["name"],
+                "unit": r["unit"],
+                "qty": round(r["qty"], ROUND),
+                "price": r["price"],
+                "amount": round(r["qty"] * r["price"], ROUND),
+                "cost": round(r["cost"], ROUND) if r["cost"] is not None else None,
+                "customer": r["customer"],
+                "note": r["note"],
+            }
+        )
+    return rows
 
 
 def record_opening(
